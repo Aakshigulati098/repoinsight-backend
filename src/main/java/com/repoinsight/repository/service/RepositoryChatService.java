@@ -86,7 +86,7 @@ public class RepositoryChatService {
 
         // Prefer Java source files for Java/Spring repositories.
         candidates.sort(Comparator.comparingInt(
-                this::filePriority));
+                path -> filePriority(path, question)));
 
         Map<String, String> sources = new LinkedHashMap<>();
         int contextChars = 0;
@@ -205,15 +205,57 @@ public class RepositoryChatService {
                 || lower.endsWith(".json");
     }
 
-    private int filePriority(String path) {
+    private int filePriority(String path, String question) {
         String lower = path.toLowerCase();
-
-        if (lower.endsWith(".java")) return 0;
-        if (lower.endsWith("readme.md")) return 1;
+        String q = question.toLowerCase();
+        int score = 50;
+        // Prefer actual application source over documentation/config.
+        if (lower.endsWith(".java")) score = 20;
+        if (lower.endsWith("readme.md")) score = 60;
         if (lower.endsWith("pom.xml")
-                || lower.endsWith("build.gradle")) return 2;
+                || lower.endsWith("build.gradle")) score = 65;
 
-        return 3;
+        // For request-flow questions, prioritize application layers.
+        boolean flowQuestion =
+                q.contains("request flow")
+                        || q.contains("controller")
+                        || q.contains("service layer")
+                        || q.contains("repository layer")
+                        || q.contains("request to")
+                        || q.contains("endpoint");
+
+        if (flowQuestion && lower.endsWith(".java")) {
+            if (lower.contains("controller")) score = 0;
+            else if (lower.contains("service")) score = 5;
+            else if (lower.contains("repository")
+                    || lower.contains("dao")) score = 10;
+            else if (lower.contains("entity")
+                    || lower.contains("/model/")) score = 20;
+            else if (lower.contains("application.java")) score = 35;
+        }
+
+        // Prioritize tests when the question is about testing.
+        if ((q.contains("test") || q.contains("unit test"))
+                && lower.endsWith(".java")
+                && (lower.contains("/test/")
+                || lower.contains("tests"))) {
+            score = -5;
+        }
+
+        // Prioritize configuration when asked about setup.
+        if ((q.contains("configuration")
+                || q.contains("config")
+                || q.contains("database")
+                || q.contains("deployment"))
+                && (lower.endsWith(".yml")
+                || lower.endsWith(".yaml")
+                || lower.endsWith(".properties")
+                || lower.endsWith(".xml")
+                || lower.endsWith(".gradle")
+                || lower.endsWith("dockerfile"))) {
+            score = 0;
+        }
+        return score;
     }
 
     private String[] parseGitHubUrl(String githubUrl) {
