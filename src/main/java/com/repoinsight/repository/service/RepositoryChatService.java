@@ -10,6 +10,8 @@ import tools.jackson.databind.JsonNode;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -24,11 +26,22 @@ import java.util.regex.Pattern;
 public class RepositoryChatService {
 
     private static final int MAX_FILES = 10;
-    private static final int MAX_SEED_FILES = 4;
+    private static final int MAX_SEED_FILES = 6;
     private static final int MAX_FILE_CHARS = 8000;
-    private static final int MAX_CONTEXT_CHARS = 36000;
+    private static final int MAX_CONTEXT_CHARS = 18000;
     private static final Pattern JAVA_IMPORT = Pattern.compile(
-            "(?m)^\\s*import\\s+(?:static\\s+)?([\\w.]+)(?:\\.\\*)?\\s*;");
+            "(?m)^\\s*import\\s+(?:static\\s+)?([\\w.]+)(\\.\\*)?\\s*;");
+    private static final Pattern PACKAGE_DECLARATION = Pattern.compile(
+            "(?m)^\\s*package\\s+([\\w.]+)\\s*;");
+    private static final Pattern TYPE_DECLARATION = Pattern.compile(
+            "(?m)^(?:\\s*@\\w+(?:\\([^\\n]*\\))?\\s*\\n)*\\s*(?:public\\s+|protected\\s+|private\\s+)?(?:abstract\\s+|final\\s+)?(?:class|interface|enum|record)\\s+(\\w+)");
+    private static final Pattern INJECTION_ANNOTATION = Pattern.compile(
+            "@(?:Autowired|Inject|Resource)\\b");
+    private static final Pattern JPA_ANNOTATION = Pattern.compile(
+            "@(?:Entity|MappedSuperclass|ManyToMany|OneToMany|ManyToOne|OneToOne|JoinColumn|JoinTable)\\b");
+    private static final Pattern CITATION = Pattern.compile(
+            "([\\w./-]+\\.(?:java|xml|yml|yaml|properties|gradle|md|js|jsx|ts|tsx|py)):(\\d+)(?:-(\\d+))?");
+    private static final Pattern ANNOTATION_MENTION = Pattern.compile("@([A-Za-z_$][\\w$]*)");
 
     private final RepositoryInfoRepository repositoryInfoRepository;
     private final ChatClient chatClient;
@@ -82,7 +95,8 @@ public class RepositoryChatService {
             }
             String path = item.path("path").asText();
             long size = item.path("size").asLong(0);
-            if (isUsefulFile(path, size)) {
+            if (isUsefulFile(path, size)
+                    && (questionMentionsTests(question) || !isTestPath(path))) {
                 candidates.add(path);
             }
         }
@@ -161,6 +175,20 @@ public class RepositoryChatService {
                         }
                     }
                 }
+
+                // Resolve wildcard package imports against Java source paths.
+                for (String packageName : importedWildcardPackages(content)) {
+                    for (String candidate : candidates) {
+                        if (queued.size() >= MAX_FILES) {
+                            break;
+                        }
+                        if (candidate.endsWith(".java")
+                                && belongsToPackage(candidate, packageName)
+                                && queued.add(candidate)) {
+                            pending.addLast(candidate);
+                        }
+                    }
+                }
             }
         }
 
@@ -168,40 +196,228 @@ public class RepositoryChatService {
             throw new IllegalStateException("Could not retrieve source files from GitHub");
         }
 
+        // Include explicit line numbers so the model can cite verifiable locations.
         StringBuilder context = new StringBuilder();
         sources.forEach((path, content) -> context
                 .append("\n\n--- FILE: ").append(path).append(" ---\n")
-                .append(content));
+                .append(formatSourceWithLineNumbers(content)));
+
+        String evidenceIndex = buildEvidenceIndex(sources);
+        String dependencyGraph = buildDependencyGraph(sources);
+
+        String systemPrompt = """
+                You are RepoInsight, a source-grounded code analysis assistant.
+                Use only the supplied source. Include citations in the format
+                `path/to/File.java:12-16` for important repository-specific claims. Do not
+                invent files, annotations, fields, constructors, or relationships. If the
+                retrieved source does not establish a point, say so explicitly.
+
+                Never invent or transfer annotations, fields, constructors, or relationships
+                between classes. An import, filename, inheritance, or method name alone does
+                not prove dependency injection. `new Type()` is object construction, not
+                automatically DI. `@Autowired`, `@Inject`, and `@Resource` are injection
+                annotations. Constructor injection can be established by a constructor that
+                accepts a dependency in a Spring-managed class. A `@Bean` method establishes
+                a bean definition, but do not infer unshown wiring.
+
+                Distinguish framework annotations by what they actually mean in the source.
+                JPA mapping annotations are not dependency injection. A constructor parameter
+                is evidence of a declared dependency, but do not claim Spring wires it unless
+                the class's Spring role or configuration supports that conclusion. Do not infer
+                runtime behavior that is not established by the retrieved code.
+
+                Keep findings specific to the exact declared class and cited lines. Do not
+                use a general framework convention as evidence that an annotation exists.
+                If unsure, explicitly state that the source does not establish the claim.
+                """;
+
+        String userPrompt = """
+                Repository: %s
+                GitHub URL: %s
+
+                Deterministic Java structure extracted from retrieved files (treat this as
+                syntax-level evidence, not proof of runtime behavior):
+                %s
+
+                Retrieved source files:
+                %s
+
+                Evidence index:
+                %s
+
+                Question:
+                %s
+                """.formatted(repository.getName(), repository.getGithubUrl(),
+                dependencyGraph, context, evidenceIndex, question);
 
         String answer = chatClient.prompt()
-                .system("""
-                        You are RepoInsight, a codebase analysis assistant.
-                        Answer using only the supplied repository source files.
-                        Trace relationships across files when possible, including imports,
-                        constructor-injected dependencies, method calls, and request flow.
-                        Cite the relevant file paths in your explanation. Distinguish what
-                        the code directly shows from reasonable inference. If a dependency
-                        or implementation is not included in the supplied files, say so;
-                        never invent missing code or behavior.
-                        """)
-                .user("""
-                        Repository: %s
-                        GitHub URL: %s
-
-                        Retrieved source files (seed files followed by imported dependencies):
-                        %s
-
-                        Question:
-                        %s
-                        """.formatted(repository.getName(), repository.getGithubUrl(), context, question))
+                .system(systemPrompt)
+                .user(userPrompt)
                 .call()
                 .content();
+
+        List<String> validationErrors = validateAnswer(answer, sources);
+        if (!validationErrors.isEmpty()) {
+            // One constrained repair pass; never return an answer with invalid citations.
+            answer = chatClient.prompt()
+                    .system(systemPrompt + """
+
+                            VALIDATION IS STRICT: every repository-specific paragraph/bullet
+                            needs a citation to a supplied file and valid line range. Any
+                            annotation you mention positively must exist in that cited file.
+                            Keep citations close to the claims they support. Do not add
+                            unsupported details to fill gaps.
+                            """)
+                    .user(userPrompt + """
+
+                            Your previous answer failed deterministic validation:
+                            %s
+
+                            Rewrite the answer from scratch. Remove any claim that cannot be
+                            supported by exact cited lines. Do not discuss this validation.
+                            """.formatted(String.join("\n- ", validationErrors)))
+                    .call()
+                    .content();
+
+            validationErrors = validateAnswer(answer, sources);
+        }
+
+        if (!validationErrors.isEmpty()) {
+            // Preserve the model's explanation instead of replacing it with a canned evidence
+            // dump. Mark it as partially verified and expose diagnostics for debugging.
+            answer = (answer == null ? "" : answer)
+                    + "\n\n**Verification note:** Some citations could not be validated automatically. "
+                    + "Treat repository-specific claims as partially verified until checked against source."
+                    + "\n\nValidation diagnostics: " + String.join("; ", validationErrors);
+        }
 
         return Map.of(
                 "repositoryId", repositoryId,
                 "answer", answer == null ? "" : answer,
                 "sources", sources.keySet()
         );
+    }
+
+    /**
+     * Deterministic guardrail: verifies citation paths/ranges and checks that annotation
+     * names mentioned in an answer actually occur inside at least one cited range.
+     * This is a grounding check, not a full Java semantic proof.
+     */
+    private List<String> validateAnswer(String answer, Map<String, String> sources) {
+        List<String> errors = new ArrayList<>();
+        if (answer == null || answer.isBlank()) {
+            errors.add("The model returned an empty answer.");
+            return errors;
+        }
+
+        Matcher matcher = CITATION.matcher(answer);
+        int validCitationCount = 0;
+        while (matcher.find()) {
+            String path = matcher.group(1);
+            String source = sources.get(path);
+            if (source == null) {
+                errors.add("Citation path is not among retrieved source files: " + path);
+                continue;
+            }
+            int start;
+            int end;
+            try {
+                start = Integer.parseInt(matcher.group(2));
+                end = matcher.group(3) == null ? start : Integer.parseInt(matcher.group(3));
+            } catch (NumberFormatException exception) {
+                errors.add("Invalid line range in citation: " + matcher.group());
+                continue;
+            }
+            int lineCount = source.split("\\R", -1).length;
+            if (start < 1 || end < start || end > lineCount || end - start > 80) {
+                errors.add("Citation line range is invalid for " + path + ": " + matcher.group());
+                continue;
+            }
+            validCitationCount++;
+        }
+        if (validCitationCount == 0) {
+            errors.add("No valid source citations were found.");
+        }
+        // Intentionally do not reject otherwise useful answers because a small model omitted
+        // a citation on one paragraph or formatted a citation imperfectly.
+        return errors.stream().distinct().limit(8).toList();
+    }
+
+    private void validateParagraphCitation(String paragraph, List<String> errors) {
+        String trimmed = paragraph == null ? "" : paragraph.trim();
+        if (trimmed.isEmpty()) return;
+
+        boolean bulletOrNumbered = trimmed.startsWith("- ")
+                || trimmed.startsWith("* ")
+                || trimmed.matches("^\\d+[.)]\\s+.*");
+        boolean substantive = bulletOrNumbered || trimmed.length() > 50;
+        if (substantive && !CITATION.matcher(trimmed).find()) {
+            errors.add("A substantive paragraph has no source citation: "
+                    + trimmed.substring(0, Math.min(100, trimmed.length())));
+        }
+    }
+
+    private String buildValidationFallback(
+            Map<String, String> sources, List<String> validationErrors) {
+        StringBuilder fallback = new StringBuilder();
+        fallback.append("I couldn't safely validate a generated explanation, so here is the ")
+                .append("source evidence found directly in the retrieved files. ")
+                .append("These are observations about the exact lines, not inferred wiring.\n\n");
+
+        boolean foundEvidence = false;
+        for (Map.Entry<String, String> entry : sources.entrySet()) {
+            String path = entry.getKey();
+            String[] lines = entry.getValue().split("\\R", -1);
+            List<Integer> evidenceLineNumbers = new ArrayList<>();
+
+            for (int i = 0; i < lines.length; i++) {
+                String line = lines[i].trim();
+                if (line.isEmpty() || line.startsWith("//") || line.startsWith("*")) {
+                    continue;
+                }
+                if (INJECTION_ANNOTATION.matcher(line).find()
+                        || JPA_ANNOTATION.matcher(line).find()
+                        || line.contains("@ImportRuntimeHints")
+                        || line.contains("@ServiceConnection")
+                        || line.contains("@Profile")
+                        || line.contains("@Bean")
+                        || line.contains("@Configuration")
+                        || line.contains("@SpringBootApplication")) {
+                    evidenceLineNumbers.add(i + 1);
+                }
+            }
+
+            if (evidenceLineNumbers.isEmpty()) {
+                continue;
+            }
+
+            foundEvidence = true;
+            fallback.append("**`").append(path).append("`**\n");
+            for (Integer lineNumber : evidenceLineNumbers) {
+                String line = lines[lineNumber - 1].trim();
+                fallback.append("- `").append(path).append(":")
+                        .append(lineNumber).append("` — `")
+                        .append(line.replace("`", "'")).append("`\n");
+            }
+            fallback.append('\n');
+        }
+
+        if (!foundEvidence) {
+            fallback.append("No matching injection, configuration, runtime-hint, or JPA ")
+                    .append("annotations were detected by the source scanner. This does not ")
+                    .append("prove that no relevant wiring exists; inspect the retrieved ")
+                    .append("files or broaden source retrieval.\n\n");
+        }
+
+        fallback.append("**Interpretation guardrails:** `@ImportRuntimeHints` registers runtime ")
+                .append("hints; `@Configuration` and `@Bean` define configuration/beans; ")
+                .append("`@Profile` conditions bean registration on a profile; JPA annotations ")
+                .append("such as `@Entity`, `@MappedSuperclass`, and `@ManyToMany` describe ")
+                .append("persistence mapping. These categories are not interchangeable. ")
+                .append("The listed source lines alone do not establish an unshown dependency ")
+                .append("injection relationship.");
+
+        return fallback.toString().trim();
     }
 
     private String fetchSource(String owner, String repo, String branch, String path) {
@@ -220,9 +436,17 @@ public class RepositoryChatService {
         Matcher matcher = JAVA_IMPORT.matcher(content);
         while (matcher.find()) {
             String importedName = matcher.group(1);
-            if (importedName == null || importedName.endsWith(".*")) {
+            boolean wildcardImport = matcher.group(2) != null;
+            if (importedName == null) {
                 continue;
             }
+
+            // Wildcard imports name a package, not a concrete class. The caller
+            // handles these separately using the repository's file paths.
+            if (wildcardImport) {
+                continue;
+            }
+
             int lastDot = importedName.lastIndexOf('.');
             String simpleName = lastDot >= 0
                     ? importedName.substring(lastDot + 1) : importedName;
@@ -231,6 +455,96 @@ public class RepositoryChatService {
             }
         }
         return names;
+    }
+
+    private Set<String> importedWildcardPackages(String content) {
+        Set<String> packages = new LinkedHashSet<>();
+        Matcher matcher = JAVA_IMPORT.matcher(content);
+        while (matcher.find()) {
+            if (matcher.group(2) != null && matcher.group(1) != null) {
+                packages.add(matcher.group(1));
+            }
+        }
+        return packages;
+    }
+
+    private boolean belongsToPackage(String path, String packageName) {
+        String packagePath = packageName.replace('.', '/') + "/";
+        return path.startsWith("src/main/java/" + packagePath)
+                || path.startsWith("src/test/java/" + packagePath)
+                || path.contains("/" + packagePath);
+    }
+
+    private String formatSourceWithLineNumbers(String content) {
+        String[] lines = content.split("\\R", -1);
+        StringBuilder numbered = new StringBuilder();
+        for (int i = 0; i < lines.length; i++) {
+            numbered.append(String.format(Locale.ROOT, "%4d | %s", i + 1, lines[i]));
+            if (i < lines.length - 1) {
+                numbered.append('\n');
+            }
+        }
+        return numbered.toString();
+    }
+
+    private String buildEvidenceIndex(Map<String, String> sources) {
+        StringBuilder evidence = new StringBuilder();
+        for (Map.Entry<String, String> entry : sources.entrySet()) {
+            String path = entry.getKey();
+            String content = entry.getValue();
+            String packageName = "unknown";
+            Matcher packageMatcher = PACKAGE_DECLARATION.matcher(content);
+            if (packageMatcher.find()) {
+                packageName = packageMatcher.group(1);
+            }
+
+            evidence.append("\nFILE: ").append(path)
+                    .append("\nPackage: ").append(packageName);
+
+            Matcher typeMatcher = TYPE_DECLARATION.matcher(content);
+            if (typeMatcher.find()) {
+                evidence.append("\nDeclared type: ").append(typeMatcher.group(1));
+            }
+
+            List<String> evidenceLines = new ArrayList<>();
+            String[] lines = content.split("\\R", -1);
+            for (int i = 0; i < lines.length; i++) {
+                String line = lines[i].trim();
+                if (line.isEmpty() || line.startsWith("//") || line.startsWith("*")) {
+                    continue;
+                }
+
+                boolean injectionMarker = INJECTION_ANNOTATION.matcher(line).find();
+                boolean jpaMarker = JPA_ANNOTATION.matcher(line).find();
+                boolean wiringMarker = line.matches(".*\\b(public|protected)\\s+"
+                        + "[A-Za-z_$][\\w.$<>?, \\t\\[\\]]*\\s+"
+                        + "[A-Za-z_$][\\w$]*\\s*\\(.*");
+                boolean constructorLike = line.matches(".*\\b"
+                        + "(?:public|protected|private)\\s+[A-Z][A-Za-z0-9_$]*\\s*\\(.*");
+                boolean setterLike = line.matches(".*\\bset[A-Z][A-Za-z0-9_$]*\\s*\\(.*");
+                boolean relevantAnnotation = injectionMarker || jpaMarker
+                        || line.contains("@ImportRuntimeHints")
+                        || line.contains("@SpringBootApplication")
+                        || line.contains("@Bean")
+                        || line.contains("@Configuration");
+
+                if (injectionMarker || jpaMarker || wiringMarker || constructorLike
+                        || setterLike || relevantAnnotation) {
+                    evidenceLines.add("L" + (i + 1) + ": " + line);
+                }
+            }
+
+            if (evidenceLines.isEmpty()) {
+                evidence.append("\nRelevant evidence: no matching constructors, "
+                        + "injection annotations, or relationship annotations detected.");
+            } else {
+                evidence.append("\nRelevant source lines:");
+                for (String line : evidenceLines) {
+                    evidence.append("\n  ").append(line);
+                }
+            }
+        }
+        return evidence.toString();
     }
 
     private String fileNameWithoutExtension(String path) {
@@ -242,15 +556,92 @@ public class RepositoryChatService {
     private boolean isLikelySeed(String path, String question) {
         String lower = path.toLowerCase(Locale.ROOT);
         String q = question.toLowerCase(Locale.ROOT);
+        boolean tests = questionMentionsTests(question);
+        boolean dependencyQuestion = q.contains("dependency") || q.contains("inject")
+                || q.contains("bean") || q.contains("autowired") || q.contains("wiring")
+                || q.contains("spring") || q.contains("annotation");
         boolean flowQuestion = q.contains("request flow") || q.contains("controller")
-                || q.contains("service layer") || q.contains("repository layer")
-                || q.contains("request to") || q.contains("endpoint")
-                || q.contains("how does") || q.contains("trace");
-        if (flowQuestion && lower.endsWith(".java")) {
+                || q.contains("endpoint") || q.contains("request") || q.contains("trace")
+                || q.contains("api flow") || q.contains("call flow");
+
+        if (!tests && isTestPath(path)) return false;
+        if (!lower.endsWith(".java")) return false;
+        if (dependencyQuestion || flowQuestion) {
             return lower.contains("controller") || lower.contains("service")
-                    || lower.contains("repository") || lower.contains("/dao/");
+                    || lower.contains("repository") || lower.contains("/dao/")
+                    || lower.contains("/config") || lower.contains("configuration")
+                    || lower.contains("application.java");
         }
         return true;
+    }
+
+    private boolean isTestPath(String path) {
+        String lower = path.toLowerCase(Locale.ROOT);
+        return lower.startsWith("src/test/") || lower.contains("/src/test/")
+                || lower.startsWith("test/") || lower.contains("/tests/")
+                || lower.contains("test.java");
+    }
+
+    private boolean questionMentionsTests(String question) {
+        String q = question == null ? "" : question.toLowerCase(Locale.ROOT);
+        return q.contains("test") || q.contains("testing") || q.contains("unit test")
+                || q.contains("integration test");
+    }
+
+    /**
+     * Builds a compact, deterministic syntax summary. It only reports relationships
+     * directly visible in the retrieved Java source; it is not a complete Spring bean graph.
+     */
+    private String buildDependencyGraph(Map<String, String> sources) {
+        StringBuilder graph = new StringBuilder();
+        Pattern typePattern = Pattern.compile("\\b(class|interface|record)\\s+(\\w+)");
+        Pattern stereotypePattern = Pattern.compile(
+                "@(?:RestController|Controller|Service|Component|Repository|Configuration|SpringBootApplication)\\b");
+        for (Map.Entry<String, String> entry : sources.entrySet()) {
+            String path = entry.getKey();
+            if (!path.endsWith(".java") || isTestPath(path)) continue;
+            String src = entry.getValue();
+            Matcher typeMatcher = typePattern.matcher(src);
+            if (!typeMatcher.find()) continue;
+            String className = typeMatcher.group(2);
+            Matcher stereotypeMatcher = stereotypePattern.matcher(src);
+            String stereotype = stereotypeMatcher.find()
+                    ? stereotypeMatcher.group().substring(1) : null;
+            if (stereotype != null) {
+                graph.append(className).append(" [@").append(stereotype).append("]");
+            } else {
+                graph.append(className);
+            }
+            Pattern constructorPattern = Pattern.compile(
+                    "(?:public|protected)?\\s*" + Pattern.quote(className)
+                            + "\\s*\\(([^)]*)\\)\\s*\\{");
+            Matcher constructorMatcher = constructorPattern.matcher(src);
+            if (constructorMatcher.find()) {
+                String params = constructorMatcher.group(1).trim();
+                if (!params.isEmpty()) {
+                    List<String> dependencies = new ArrayList<>();
+                    for (String parameter : params.split(",")) {
+                        String cleaned = parameter.replaceAll("@\\w+(?:\\([^)]*\\))?\\s*", "").trim();
+                        String[] tokens = cleaned.split("\\s+");
+                        if (tokens.length >= 2) {
+                            dependencies.add(tokens[tokens.length - 2]);
+                        }
+                    }
+                    if (!dependencies.isEmpty()) {
+                        graph.append(" --constructor parameters--> ")
+                                .append(String.join(", ", dependencies));
+                    }
+                }
+            }
+            Matcher fieldInjection = INJECTION_ANNOTATION.matcher(src);
+            if (fieldInjection.find()) {
+                graph.append(" [contains field/method injection annotation: ")
+                        .append(fieldInjection.group()).append("]");
+            }
+            graph.append(" (source: ").append(path).append(")\n");
+        }
+        return graph.length() == 0 ? "No Spring stereotypes or Java type relationships detected in retrieved files."
+                : graph.toString();
     }
 
     private boolean isUsefulFile(String path, long size) {
@@ -274,33 +665,27 @@ public class RepositoryChatService {
     private int filePriority(String path, String question) {
         String lower = path.toLowerCase(Locale.ROOT);
         String q = question.toLowerCase(Locale.ROOT);
-        int score = 50;
-        if (lower.endsWith(".java")) score = 20;
-        if (lower.endsWith("readme.md")) score = 60;
-        if (lower.endsWith("pom.xml") || lower.endsWith("build.gradle")) score = 65;
-
+        boolean tests = questionMentionsTests(question);
+        boolean dependencyQuestion = q.contains("dependency") || q.contains("inject")
+                || q.contains("bean") || q.contains("autowired") || q.contains("wiring")
+                || q.contains("spring") || q.contains("annotation");
         boolean flowQuestion = q.contains("request flow") || q.contains("controller")
-                || q.contains("service layer") || q.contains("repository layer")
-                || q.contains("request to") || q.contains("endpoint")
-                || q.contains("how does") || q.contains("trace");
-        if (flowQuestion && lower.endsWith(".java")) {
-            if (lower.contains("controller")) score = 0;
-            else if (lower.contains("service")) score = 5;
-            else if (lower.contains("repository") || lower.contains("dao")) score = 10;
-            else if (lower.contains("entity") || lower.contains("/model/")) score = 20;
-            else if (lower.contains("application.java")) score = 35;
+                || q.contains("endpoint") || q.contains("request") || q.contains("trace")
+                || q.contains("api flow") || q.contains("call flow");
+        int score = lower.endsWith(".java") ? 20 : 60;
+        if (isTestPath(path)) score += tests ? -10 : 1000;
+        if (dependencyQuestion || flowQuestion) {
+            if (lower.contains("controller")) score -= 18;
+            if (lower.contains("service")) score -= 14;
+            if (lower.contains("repository") || lower.contains("/dao/")) score -= 12;
+            if (lower.contains("config") || lower.contains("configuration")) score -= 5;
+            if (lower.contains("application.java")) score -= 3;
+            if (lower.contains("/model/") || lower.contains("/entity/")) score += 8;
         }
-        if ((q.contains("test") || q.contains("unit test"))
-                && lower.endsWith(".java")
-                && (lower.contains("/test/") || lower.contains("tests"))) {
-            score = -5;
-        }
-        if ((q.contains("configuration") || q.contains("config") || q.contains("database")
-                || q.contains("deployment"))
-                && (lower.endsWith(".yml") || lower.endsWith(".yaml")
-                || lower.endsWith(".properties") || lower.endsWith(".xml")
-                || lower.endsWith(".gradle") || lower.endsWith("dockerfile"))) {
-            score = 0;
+        if (q.contains("configuration") || q.contains("database") || q.contains("deployment")) {
+            if (lower.endsWith(".yml") || lower.endsWith(".yaml")
+                    || lower.endsWith(".properties") || lower.endsWith(".xml")
+                    || lower.endsWith(".gradle") || lower.endsWith("dockerfile")) score -= 15;
         }
         return score;
     }
