@@ -38,24 +38,22 @@ public class GithubClientService {
                 || !"github.com".equalsIgnoreCase(uri.getHost())
                 || uri.getUserInfo() != null
                 || uri.getPort() != -1) {
-            throw new IllegalArgumentException("Invalid GitHub repository URL");
+            throw new IllegalArgumentException(
+                    "Invalid GitHub repository URL");
         }
 
         String path = uri.getPath();
 
         if (path == null) {
-            throw new IllegalArgumentException("Invalid GitHub repository URL");
+            throw new IllegalArgumentException(
+                    "Invalid GitHub repository URL");
         }
 
         String[] parts = path.replaceAll("^/|/$", "").split("/");
 
         if (parts.length != 2
                 || parts[0].isBlank()
-                || parts[1].isBlank()
-                || parts[0].equals(".")
-                || parts[1].equals(".")
-                || parts[0].equals("..")
-                || parts[1].equals("..")) {
+                || parts[1].isBlank()) {
             throw new IllegalArgumentException(
                     "URL must look like https://github.com/owner/repository");
         }
@@ -63,11 +61,34 @@ public class GithubClientService {
         String owner = parts[0];
         String repo = parts[1].replaceFirst("\\.git$", "");
 
-        return restClient.get()
-                .uri("/repos/{owner}/{repo}", owner, repo)
-                .retrieve()
-                .body(GithubRepositoryResponse.class);
+        try {
+            GithubRepositoryResponse response = restClient.get()
+                    .uri("/repos/{owner}/{repo}", owner, repo)
+                    .retrieve()
+                    .body(GithubRepositoryResponse.class);
+
+            if (response == null) {
+                throw new IllegalStateException(
+                        "GitHub returned an empty repository response");
+            }
+
+            return response;
+
+        } catch (org.springframework.web.client.HttpClientErrorException.NotFound ex) {
+            throw new org.springframework.web.server.ResponseStatusException(
+                    org.springframework.http.HttpStatus.NOT_FOUND,
+                    "GitHub repository not found or inaccessible");
+        } catch (org.springframework.web.client.HttpClientErrorException ex) {
+            throw new org.springframework.web.server.ResponseStatusException(
+                    org.springframework.http.HttpStatus.BAD_REQUEST,
+                    "GitHub rejected the repository request");
+        } catch (org.springframework.web.client.HttpServerErrorException ex) {
+            throw new org.springframework.web.server.ResponseStatusException(
+                    org.springframework.http.HttpStatus.BAD_GATEWAY,
+                    "GitHub is temporarily unavailable");
+        }
     }
+
     public String fetchReadme(String githubUrl) {
         String[] parts = getOwnerAndRepo(githubUrl);
 
