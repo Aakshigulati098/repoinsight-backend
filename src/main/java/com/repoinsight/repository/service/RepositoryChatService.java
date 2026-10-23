@@ -283,10 +283,13 @@ public class RepositoryChatService {
         }
 
         if (!validationErrors.isEmpty()) {
-            // Fail closed: do not return an unverified model explanation as if it were grounded.
-            // The fallback is generated directly from retrieved source lines and cannot invent
-            // dependency relationships. Keep diagnostics in server logs, not in user-facing prose.
-            answer = buildValidationFallback(sources, validationErrors, question);
+            // Do not discard a non-empty explanation solely because citation formatting failed.
+            // The strict validator is a citation-quality check, not a reason to replace a
+            // general answer with a Java-annotation evidence dump. Keep the deterministic
+            // evidence fallback only for genuinely empty model responses.
+            if (answer == null || answer.isBlank()) {
+                answer = buildValidationFallback(sources, validationErrors, question);
+            }
         }
 
         return Map.of(
@@ -448,8 +451,10 @@ public class RepositoryChatService {
             fallback.append("- A Spring stereotype such as @Controller, @Service, or @Repository ")
                     .append("marks a class for Spring management.\n");
             fallback.append("- A constructor parameter in such a class is evidence of a declared ")
-                    .append("dependency. If this is the class's only constructor, Spring can use ")
-                    .append("constructor injection without an explicit @Autowired annotation.\n");
+                    .append("dependency, but the signature alone does not prove that Spring created ")
+                    .append("or injected the object. Verify that the parameter type is a Spring bean ")
+                    .append("and that this is the class's only constructor before claiming implicit ")
+                    .append("constructor injection. A sole constructor does not need @Autowired.\n");
             fallback.append("- @Autowired, @Inject, or @Resource on a field, method, or constructor ")
                     .append("is explicit injection evidence. Do not treat @PathVariable, @ModelAttribute, ")
                     .append("@Valid, or JPA mapping annotations as dependency-injection annotations.\n");
