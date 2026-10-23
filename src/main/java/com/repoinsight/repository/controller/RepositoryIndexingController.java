@@ -2,6 +2,7 @@ package com.repoinsight.repository.controller;
 
 import com.repoinsight.repository.service.ChatHistoryService;
 import com.repoinsight.repository.service.RepositoryChatService;
+import com.repoinsight.repository.service.RepositoryIndexService;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -13,12 +14,16 @@ public class RepositoryIndexingController {
 
     private final RepositoryChatService chatService;
     private final ChatHistoryService chatHistoryService;
+    private final RepositoryIndexService repositoryIndexService;
 
     public RepositoryIndexingController(
             RepositoryChatService chatService,
-            ChatHistoryService chatHistoryService) {
+            ChatHistoryService chatHistoryService,
+            RepositoryIndexService repositoryIndexService) {
+
         this.chatService = chatService;
         this.chatHistoryService = chatHistoryService;
+        this.repositoryIndexService = repositoryIndexService;
     }
 
     // Existing endpoint retained for backward compatibility.
@@ -45,5 +50,11 @@ public class RepositoryIndexingController {
     @GetMapping("/{id}/chats")
     public List<Map<String, Object>> listChats(@PathVariable("id") Long id) {
         return chatHistoryService.listChats(id);
+    }
+
+    @PostMapping("/{id}/index")
+    public Map<String, Object> indexRepository(
+            @PathVariable("id") Long id) {
+        return repositoryIndexService.indexRepository(id);
     }
 }

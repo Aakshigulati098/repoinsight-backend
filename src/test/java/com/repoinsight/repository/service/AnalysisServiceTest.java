@@ -7,9 +7,9 @@ import com.repoinsight.repository.entity.RepositoryInfo;
 import com.repoinsight.repository.exception.RepositoryNotFoundException;
 import com.repoinsight.repository.repository.AnalysisReportRepository;
 import com.repoinsight.repository.repository.RepositoryInfoRepository;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -38,8 +38,25 @@ class AnalysisServiceTest {
     @Mock
     private AiSummaryService aiSummaryService;
 
-    @InjectMocks
     private AnalysisService service;
+
+    @BeforeEach
+    void setUp() {
+        AnalysisExecutionService executionService =
+                new AnalysisExecutionService(
+                        analysisReportRepository,
+                        repositoryInfoRepository,
+                        gitHubClientService,
+                        aiSummaryService);
+        AnalysisFailureService failureService =
+                new AnalysisFailureService(analysisReportRepository);
+
+        service = new AnalysisService(
+                repositoryInfoRepository,
+                analysisReportRepository,
+                executionService,
+                failureService);
+    }
 
     @Test
     void analyzeRepository_WhenRepositoryMissing_ThrowsRepositoryNotFoundException() {

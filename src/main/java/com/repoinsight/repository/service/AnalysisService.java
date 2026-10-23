@@ -46,12 +46,30 @@ public class AnalysisService {
         return analyzeReport(report.getId());
     }
 
+    public AnalysisReport markReportFailed(Long reportId) {
+        return analysisFailureService.markFailed(reportId);
+    }
+
 
     public AnalysisReport analyzeReport(Long reportId) {
-        // Commit IN_PROGRESS before the lengthy analysis begins.
-        analysisFailureService.markInProgress(reportId);
+        if (reportId == null || reportId <= 0) {
+            throw new IllegalArgumentException("reportId must be a positive number");
+        }
+
+        AnalysisReport existing = analysisReportRepository.findById(reportId)
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "Analysis report not found: " + reportId));
+
+        // Kafka can redeliver messages. Completed reports are idempotently ignored.
+        // IN_PROGRESS is deliberately not skipped: a previous consumer may have
+        // crashed after persisting that status, and redelivery should be able to retry.
+        if (existing.getStatus() == AnalysisStatus.COMPLETED) {
+            return existing;
+        }
 
         try {
+            // Persist IN_PROGRESS before starting the long-running work.
+            analysisFailureService.markInProgress(reportId);
             return analysisExecutionService.executeAnalysis(reportId);
         } catch (RuntimeException ex) {
             System.err.println(

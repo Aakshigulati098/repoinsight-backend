@@ -2,6 +2,8 @@ package com.repoinsight.repository.service;
 
 import com.repoinsight.repository.entity.RepositoryInfo;
 import com.repoinsight.repository.repository.RepositoryInfoRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
@@ -19,6 +21,9 @@ import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.vectorstore.SearchRequest;
+import org.springframework.ai.vectorstore.VectorStore;
 
 @Service
 public class RepositoryChatService {
@@ -45,13 +50,19 @@ public class RepositoryChatService {
     private final ChatClient chatClient;
     private final RestClient githubClient;
     private final RestClient rawGitHubClient;
+    private final VectorStore vectorStore;
+
+    private static final Logger log =
+            LoggerFactory.getLogger(RepositoryChatService.class);
 
     public RepositoryChatService(
             RepositoryInfoRepository repositoryInfoRepository,
-            ChatClient.Builder chatClientBuilder) {
+            ChatClient.Builder chatClientBuilder,
+            VectorStore vectorStore) {
 
         this.repositoryInfoRepository = repositoryInfoRepository;
         this.chatClient = chatClientBuilder.build();
+        this.vectorStore = vectorStore;
         this.githubClient = RestClient.builder()
                 .baseUrl("https://api.github.com")
                 .defaultHeader("Accept", "application/vnd.github+json")
@@ -67,6 +78,13 @@ public class RepositoryChatService {
         RepositoryInfo repository = repositoryInfoRepository.findById(repositoryId)
                 .orElseThrow(() -> new IllegalArgumentException(
                         "Repository not found: " + repositoryId));
+
+        Map<String, Object> ragAnswer =
+                answerUsingRag(repository, repositoryId, question);
+
+        if (ragAnswer != null) {
+            return ragAnswer;
+        }
 
         String[] parts = parseGitHubUrl(repository.getGithubUrl());
         String owner = parts[0];
@@ -792,4 +810,198 @@ public class RepositoryChatService {
         }
         return new String[]{parts[0], parts[1].replaceFirst("\\.git$", "")};
     }
+
+    private Map<String, Object> answerUsingRag(
+            RepositoryInfo repository,
+            Long repositoryId,
+            String question) {
+
+        // Retrieve a wider candidate set, then rerank it before sending to the LLM.
+        List<Document> matches = vectorStore.similaritySearch(
+                SearchRequest.builder()
+                        .query(question)
+                        .topK(20)
+                        .filterExpression("repositoryId == " + repositoryId)
+                        .build());
+
+        if (matches == null || matches.isEmpty()) {
+            return null;
+        }
+
+        // Rank chunks using both the question and the retrieved source code.
+        List<Document> rankedMatches = new ArrayList<>(matches);
+        rankedMatches.sort(
+                Comparator.comparingInt(
+                                (Document document) -> scoreChunk(document, question))
+                        .reversed());
+
+        // Keep the final context small and relevant.
+        List<Document> selected = rankedMatches.stream()
+                .limit(6)
+                .toList();
+
+        StringBuilder context = new StringBuilder();
+        Set<String> sourcePaths = new LinkedHashSet<>();
+
+        for (Document document : selected) {
+            Object pathValue = document.getMetadata().get("filePath");
+            String path = pathValue == null
+                    ? "Unknown source file"
+                    : pathValue.toString();
+
+            sourcePaths.add(path);
+
+            context.append("\n\n--- FILE: ")
+                    .append(path)
+                    .append(" ---\n")
+                    .append(document.getText())
+                    .append("\n");
+        }
+
+        String systemPrompt = """
+            You are RepoInsight, a precise repository code analysis assistant.
+
+            Answer repository-specific questions using only the retrieved code.
+            Never invent classes, methods, endpoints, annotations, or behavior.
+
+            RETRIEVAL RULES:
+            - Retrieved chunks are candidates, not automatically correct evidence.
+            - Select evidence that directly answers the user's question.
+            - Do not treat code that merely mentions a class or application as
+              proof that it handles HTTP requests.
+            - For HTTP request handling, look for direct evidence such as
+              @RestController, @Controller, @RequestMapping, @GetMapping,
+              @PostMapping, or equivalent framework-specific route definitions.
+            - Distinguish application startup, build plugins, business services,
+              repositories, and HTTP controllers.
+            - If no supplied chunk establishes the answer, say that the available
+              retrieved code is insufficient to identify it.
+            - Do not infer that a class exists merely because it is common in
+              Spring Boot applications.
+
+            ANSWER FORMAT:
+            - Answer the question directly.
+            - Name the relevant source file for each important claim.
+            - Explain what the retrieved code actually demonstrates.
+            - Explicitly mention uncertainty when the evidence is incomplete.
+            """;
+
+        String userPrompt = """
+            Repository: %s
+            GitHub URL: %s
+
+            Retrieved code, ranked for this question:
+            %s
+
+            Question:
+            %s
+            """.formatted(
+                repository.getName(),
+                repository.getGithubUrl(),
+                context,
+                question);
+
+        String answer = chatClient.prompt()
+                .system(systemPrompt)
+                .user(userPrompt)
+                .call()
+                .content();
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("repositoryId", repositoryId);
+        response.put("answer", answer == null ? "" : answer);
+        response.put("sources", sourcePaths);
+        response.put("retrieval", "RAG");
+
+        return response;
+    }
+
+    private int scoreChunk(Document document, String question) {
+        String text = document.getText() == null
+                ? ""
+                : document.getText().toLowerCase(Locale.ROOT);
+
+        Object pathValue = document.getMetadata().get("filePath");
+        String path = pathValue == null
+                ? ""
+                : pathValue.toString().toLowerCase(Locale.ROOT);
+
+        String q = question.toLowerCase(Locale.ROOT);
+        int score = 0;
+
+        // Reward overlap between meaningful question terms and the chunk.
+        Set<String> stopWords = Set.of(
+                "the", "a", "an", "and", "or", "in", "on", "to", "of",
+                "for", "is", "are", "does", "do", "how", "what", "which",
+                "this", "that", "it", "its", "with", "from", "using",
+                "explain", "identify", "find", "main", "each");
+
+        Set<String> questionTerms = new LinkedHashSet<>();
+        for (String token : q.split("[^a-z0-9_]+")) {
+            if (token.length() > 2 && !stopWords.contains(token)) {
+                questionTerms.add(token);
+            }
+        }
+
+        for (String term : questionTerms) {
+            if (path.contains(term)) {
+                score += 5;
+            }
+            if (text.contains(term)) {
+                score += 2;
+            }
+        }
+
+        // Intent-specific ranking for HTTP endpoint/controller questions.
+        boolean httpQuestion = q.contains("http")
+                || q.contains("request")
+                || q.contains("endpoint")
+                || q.contains("controller")
+                || q.contains("route");
+
+        if (httpQuestion) {
+            if (path.contains("controller")) score += 15;
+            if (path.contains("resource")) score += 3;
+
+            if (text.contains("@restcontroller")) score += 20;
+            if (text.contains("@controller")) score += 15;
+            if (text.contains("@requestmapping")) score += 12;
+            if (text.contains("@getmapping")
+                    || text.contains("@postmapping")
+                    || text.contains("@putmapping")
+                    || text.contains("@deletemapping")
+                    || text.contains("@patchmapping")) {
+                score += 12;
+            }
+
+            // Avoid confusing build tooling with application request handling.
+            if (path.contains("build-plugin/")
+                    || path.contains("/gradle/")
+                    || path.contains("findmainclass")) {
+                score -= 15;
+            }
+        }
+
+        // Small boosts for other common repository questions.
+        if (q.contains("dependency injection")
+                || q.contains("bean wiring")
+                || q.contains("autowired")) {
+            if (text.contains("@autowired")
+                    || text.contains("@inject")
+                    || text.contains("@resource")) {
+                score += 12;
+            }
+            if (path.contains("config")) score += 5;
+        }
+
+        if (q.contains("database") || q.contains("query")) {
+            if (path.contains("repository") || path.contains("/dao/")) {
+                score += 10;
+            }
+            if (text.contains("@query")) score += 8;
+        }
+
+        return score;
+    }
+
 }
