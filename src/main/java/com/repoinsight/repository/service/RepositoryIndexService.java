@@ -3,234 +3,275 @@ package com.repoinsight.repository.service;
 
 import com.repoinsight.repository.entity.RepositoryInfo;
 import com.repoinsight.repository.repository.RepositoryInfoRepository;
+import org.springframework.scheduling.annotation.Async;
+import tools.jackson.databind.JsonNode;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
-import tools.jackson.databind.JsonNode;
 
+import java.net.URI;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 
 @Service
 public class RepositoryIndexService {
 
-    private static final int MAX_FILES = 150;
-    private static final int MAX_FILE_SIZE = 80_000;
-    // Keep a conservative character limit so code-heavy text stays below the
-    // embedding model's 512-token physical batch limit.
-    private static final int MAX_CHUNK_CHARS = 500;
-    private static final int OVERLAP_CHARS = 75;
+    private static final int MAX_CHUNK_CHARS = 300;
+    private static final int CHUNK_OVERLAP_CHARS = 50;
 
-    private final RepositoryInfoRepository repositoryRepository;
+    private final RepositoryInfoRepository repositoryInfoRepository;
     private final VectorStore vectorStore;
+    private final JdbcTemplate jdbcTemplate;
     private final RestClient githubClient;
-    private final RestClient rawClient;
 
     public RepositoryIndexService(
-            RepositoryInfoRepository repositoryRepository,
-            VectorStore vectorStore) {
-        this.repositoryRepository = repositoryRepository;
+            RepositoryInfoRepository repositoryInfoRepository,
+            VectorStore vectorStore,
+            JdbcTemplate jdbcTemplate) {
+        this.repositoryInfoRepository = repositoryInfoRepository;
         this.vectorStore = vectorStore;
-
+        this.jdbcTemplate = jdbcTemplate;
         this.githubClient = RestClient.builder()
                 .baseUrl("https://api.github.com")
                 .defaultHeader("Accept", "application/vnd.github+json")
                 .build();
-
-        this.rawClient = RestClient.create();
     }
 
-    public Map<String, Object> indexRepository(Long repositoryId) {
-        RepositoryInfo repository = repositoryRepository
+
+    @Async("indexingExecutor")
+    public CompletableFuture<Integer> indexRepositoryAsync(Long repositoryId) {
+        try {
+            int chunks = indexRepository(repositoryId);
+            return CompletableFuture.completedFuture(chunks);
+        } catch (RuntimeException indexingException) {
+            try {
+                repositoryInfoRepository.findById(repositoryId)
+                        .ifPresent(repository -> updateStatus(
+                                repository,
+                                "FAILED",
+                                repository.getIndexingProgress() == null
+                                        ? 0 : repository.getIndexingProgress(),
+                                repository.getIndexedChunks(),
+                                indexingException.getMessage()));
+            } catch (RuntimeException statusException) {
+                indexingException.addSuppressed(statusException);
+            }
+            return CompletableFuture.failedFuture(indexingException);
+        }
+    }
+
+    public int indexRepository(Long repositoryId) {
+        RepositoryInfo repository = repositoryInfoRepository
                 .findById(repositoryId)
                 .orElseThrow(() ->
-                        new IllegalArgumentException(
-                                "Repository not found: " + repositoryId));
+                        new IllegalArgumentException("Repository not found: "
+                                + repositoryId));
 
+        updateStatus(repository, "IN_PROGRESS", 0, 0, null);
         String[] parts = parseGitHubUrl(repository.getGithubUrl());
         String owner = parts[0];
         String repo = parts[1];
+        String branch = repository.getDefaultBranch();
 
-        String defaultBranch = repository.getDefaultBranch();
-        String branch = defaultBranch == null || defaultBranch.isBlank()
-                ? "main" : defaultBranch;
+        if (branch == null || branch.isBlank()) {
+            branch = "main";
+        }
 
-        JsonNode tree = githubClient.get()
+        String finalBranch = branch;
+
+        JsonNode treeResponse = githubClient.get()
                 .uri(uriBuilder -> uriBuilder
                         .path("/repos/{owner}/{repo}/git/trees/{branch}")
                         .queryParam("recursive", "1")
-                        .build(owner, repo, branch))
+                        .build(owner, repo, finalBranch))
                 .retrieve()
                 .body(JsonNode.class);
 
-        if (tree == null || !tree.has("tree")) {
-            throw new IllegalStateException(
-                    "Could not fetch the GitHub repository tree");
+        if (treeResponse == null || !treeResponse.has("tree")) {
+            throw new IllegalStateException("Could not fetch repository tree");
         }
 
         List<Document> documents = new ArrayList<>();
-        int indexedFiles = 0;
+        // Tag this indexing run so new chunks can be distinguished from the
+        // currently active index until the replacement has been stored.
+        String indexVersion = UUID.randomUUID().toString();
 
-        for (JsonNode item : tree.path("tree")) {
+        for (JsonNode item : treeResponse.path("tree")) {
             if (!"blob".equals(item.path("type").asText())) {
                 continue;
             }
 
             String path = item.path("path").asText();
-            long size = item.path("size").asLong(0);
 
-            if (!isSupportedFile(path, size)) {
+            if (!isIndexable(path, item.path("size").asLong(0))) {
                 continue;
             }
 
-            if (indexedFiles >= MAX_FILES) {
-                break;
+            try {
+                String rawUrl = "https://raw.githubusercontent.com/"
+                        + owner + "/" + repo + "/"
+                        + finalBranch + "/" + path;
+
+                String content = RestClient.create()
+                        .get()
+                        .uri(URI.create(rawUrl))
+                        .retrieve()
+                        .body(String.class);
+
+                if (content == null || content.isBlank()) {
+                    continue;
+                }
+
+                List<String> chunks = chunkContent(content);
+                for (int chunkNumber = 0; chunkNumber < chunks.size(); chunkNumber++) {
+                    documents.add(new Document(
+                            chunks.get(chunkNumber),
+                            Map.of(
+                                    "repositoryId", repositoryId,
+                                    "repositoryName", repository.getName(),
+                                    "filePath", path,
+                                    "chunkNumber", chunkNumber,
+                                    "indexVersion", indexVersion
+                            )
+                    ));
+                }
+            } catch (Exception exception) {
+                throw exception;
             }
-
-            String content = fetchSource(owner, repo, branch, path);
-
-            if (content == null || content.isBlank()) {
-                continue;
-            }
-
-            if (content.length() > MAX_FILE_SIZE) {
-                content = content.substring(0, MAX_FILE_SIZE);
-            }
-
-            List<String> chunks = chunk(content);
-
-            for (int i = 0; i < chunks.size(); i++) {
-                Map<String, Object> metadata = new HashMap<>();
-                metadata.put("repositoryId", repositoryId);
-                metadata.put("repositoryName", repository.getName());
-                metadata.put("filePath", path);
-                metadata.put("chunkIndex", i);
-                metadata.put("githubUrl", repository.getGithubUrl());
-
-                documents.add(new Document(chunks.get(i), metadata));
-            }
-
-            indexedFiles++;
         }
 
         if (documents.isEmpty()) {
             throw new IllegalStateException(
-                    "No supported source files could be indexed");
+                    "No indexable source files were found.");
+        }
+        try {
+            vectorStore.add(documents);
+        } catch (RuntimeException exception) {
+            deleteIndexVersion(repositoryId, indexVersion);
+            throw exception;
         }
 
-        // Replace this repository's previous index only after
-        // source retrieval and chunking have completed successfully.
-        vectorStore.delete("repositoryId == " + repositoryId);
-        vectorStore.add(documents);
+        jdbcTemplate.update(
+                "DELETE FROM vector_store " +
+                        "WHERE metadata->>'repositoryId' = ? " +
+                        "AND metadata->>'indexVersion' IS DISTINCT FROM ?",
+                repositoryId.toString(),
+                indexVersion
+        );
 
-        return Map.of(
-                "repositoryId", repositoryId,
-                "indexedFiles", indexedFiles,
-                "indexedChunks", documents.size(),
-                "status", "COMPLETED"
+        updateStatus(
+                repository,
+                "COMPLETED",
+                100,
+                documents.size(),
+                null
+        );
+
+        return documents.size();
+    }
+
+    private void deleteIndexVersion(Long repositoryId, String indexVersion) {
+        jdbcTemplate.update(
+                "DELETE FROM vector_store " +
+                        "WHERE metadata->>'repositoryId' = ? " +
+                        "AND metadata->>'indexVersion' = ?",
+                repositoryId.toString(),
+                indexVersion
         );
     }
 
-    private String fetchSource(
-            String owner, String repo, String branch, String path) {
-        try {
-            String url = "https://raw.githubusercontent.com/"
-                    + owner + "/" + repo + "/" + branch + "/" + path;
+    private void updateStatus(
+            RepositoryInfo repository,
+            String status,
+            int progress,
+            Integer chunks,
+            String error) {
 
-            return rawClient.get()
-                    .uri(url)
-                    .retrieve()
-                    .body(String.class);
-        } catch (Exception exception) {
-            // Skip unavailable files.
-            return null;
+        repository.setIndexingStatus(status);
+        repository.setIndexingProgress(progress);
+        repository.setIndexedChunks(chunks);
+        repository.setIndexingError(error);
+
+        if ("IN_PROGRESS".equals(status)) {
+            repository.setIndexingStartedAt(LocalDateTime.now());
+            repository.setIndexingCompletedAt(null);
         }
+
+        if ("COMPLETED".equals(status) || "FAILED".equals(status)) {
+            repository.setIndexingCompletedAt(LocalDateTime.now());
+        }
+
+        repositoryInfoRepository.save(repository);
     }
 
-
-    private List<String> chunk(String content) {
+    static List<String> chunkContent(String content) {
         List<String> chunks = new ArrayList<>();
-
         if (content == null || content.isBlank()) {
             return chunks;
         }
 
-        int start = 0;
-
-        while (start < content.length()) {
-            int end = Math.min(
-                    start + MAX_CHUNK_CHARS,
-                    content.length()
-            );
-
-            // Prefer ending at a newline to preserve source-code structure.
-            if (end < content.length()) {
-                int newline = content.lastIndexOf('\n', end);
-
-                // Avoid producing a very small chunk just to find a newline.
-                if (newline > start + MAX_CHUNK_CHARS / 2) {
-                    end = newline + 1;
-                }
-            }
-
-            String text = content.substring(start, end).trim();
-
-            if (!text.isBlank()) {
-                chunks.add(text);
-            }
-
-            if (end >= content.length()) {
+        for (int start = 0; start < content.length();) {
+            int end = Math.min(start + MAX_CHUNK_CHARS, content.length());
+            chunks.add(content.substring(start, end));
+            if (end == content.length()) {
                 break;
             }
-
-            // Move forward while retaining a small overlap.
-            start = Math.max(start + 1, end - OVERLAP_CHARS);
+            start = end - CHUNK_OVERLAP_CHARS;
         }
-
         return chunks;
     }
 
-
-    private boolean isSupportedFile(String path, long size) {
+    private boolean isIndexable(String path, long size) {
         String lower = path.toLowerCase();
 
-        if (size <= 0 || size > MAX_FILE_SIZE || path.contains(" ")) {
+        if (size <= 0 || size > 200_000) {
             return false;
         }
 
-        if (lower.contains("node_modules/")
-                || lower.contains("/build/")
-                || lower.contains("/target/")
-                || lower.contains("/dist/")
-                || lower.startsWith(".git/")) {
+        if (lower.startsWith(".git/")
+                || lower.startsWith("node_modules/")
+                || lower.startsWith("build/")
+                || lower.startsWith("target/")
+                || lower.contains("/node_modules/")) {
             return false;
         }
 
         return lower.endsWith(".java")
-                || lower.endsWith(".py")
                 || lower.endsWith(".js")
                 || lower.endsWith(".jsx")
                 || lower.endsWith(".ts")
                 || lower.endsWith(".tsx")
-                || lower.endsWith(".md")
+                || lower.endsWith(".py")
+                || lower.endsWith(".go")
+                || lower.endsWith(".html")
+                || lower.endsWith(".css")
+                || lower.endsWith(".sql")
                 || lower.endsWith(".xml")
                 || lower.endsWith(".yml")
                 || lower.endsWith(".yaml")
                 || lower.endsWith(".properties")
-                || lower.endsWith(".gradle")
-                || lower.endsWith(".json");
+                || lower.endsWith(".md")
+                || lowerendsWithConfig(lower);
+    }
+
+    private boolean lowerendsWithConfig(String path) {
+        return path.endsWith(".json")
+                || path.endsWith(".gradle")
+                || path.endsWith(".gradle.kts")
+                || path.endsWith(".toml");
     }
 
     private String[] parseGitHubUrl(String githubUrl) {
-        java.net.URI uri = java.net.URI.create(githubUrl);
+        URI uri = URI.create(githubUrl);
 
         if (!"https".equals(uri.getScheme())
-                || !"github.com".equalsIgnoreCase(uri.getHost())
-                || uri.getUserInfo() != null
-                || uri.getPort() != -1) {
+                || !"github.com".equalsIgnoreCase(uri.getHost())) {
             throw new IllegalArgumentException("Invalid GitHub URL");
         }
 
@@ -238,7 +279,7 @@ public class RepositoryIndexService {
                 .replaceAll("^/|/$", "")
                 .split("/");
 
-        if (parts.length != 2) {
+        if (parts.length < 2) {
             throw new IllegalArgumentException("Invalid GitHub repository URL");
         }
 

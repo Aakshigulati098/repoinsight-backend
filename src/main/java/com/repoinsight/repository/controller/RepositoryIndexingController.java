@@ -1,10 +1,14 @@
 package com.repoinsight.repository.controller;
 
+import com.repoinsight.repository.entity.RepositoryInfo;
 import com.repoinsight.repository.service.ChatHistoryService;
 import com.repoinsight.repository.service.RepositoryChatService;
 import com.repoinsight.repository.service.RepositoryIndexService;
+import com.repoinsight.repository.repository.RepositoryInfoRepository;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -15,15 +19,18 @@ public class RepositoryIndexingController {
     private final RepositoryChatService chatService;
     private final ChatHistoryService chatHistoryService;
     private final RepositoryIndexService repositoryIndexService;
+    private final RepositoryInfoRepository repositoryInfoRepository;
 
     public RepositoryIndexingController(
             RepositoryChatService chatService,
             ChatHistoryService chatHistoryService,
-            RepositoryIndexService repositoryIndexService) {
+            RepositoryIndexService repositoryIndexService,
+            RepositoryInfoRepository repositoryInfoRepository) {
 
         this.chatService = chatService;
         this.chatHistoryService = chatHistoryService;
         this.repositoryIndexService = repositoryIndexService;
+        this.repositoryInfoRepository = repositoryInfoRepository;
     }
 
     // Existing endpoint retained for backward compatibility.
@@ -53,8 +60,38 @@ public class RepositoryIndexingController {
     }
 
     @PostMapping("/{id}/index")
-    public Map<String, Object> indexRepository(
+    public ResponseEntity<Map<String, Object>> indexRepository(
             @PathVariable("id") Long id) {
-        return repositoryIndexService.indexRepository(id);
+
+        repositoryIndexService.indexRepositoryAsync(id);
+
+        return ResponseEntity.accepted().body(Map.of(
+                "repositoryId", id,
+                "status", "IN_PROGRESS",
+                "message", "Repository indexing has been started"
+        ));
+    }
+
+
+    @GetMapping("/{id}/index/status")
+    public Map<String, Object> getIndexingStatus(
+            @PathVariable("id") Long id) {
+
+        RepositoryInfo repository = repositoryInfoRepository
+                .findById(id)
+                .orElseThrow(() ->
+                        new IllegalArgumentException(
+                                "Repository not found: " + id));
+
+        Map<String, Object> response = new HashMap<>();
+        response.put("repositoryId", repository.getId());
+        response.put("status", repository.getIndexingStatus());
+        response.put("progress", repository.getIndexingProgress());
+        response.put("chunksIndexed", repository.getIndexedChunks());
+        response.put("startedAt", repository.getIndexingStartedAt());
+        response.put("completedAt", repository.getIndexingCompletedAt());
+        response.put("error", repository.getIndexingError());
+
+        return response;
     }
 }

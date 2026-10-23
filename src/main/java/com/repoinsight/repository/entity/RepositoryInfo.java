@@ -5,6 +5,8 @@ import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 
+import java.time.LocalDateTime;
+
 @Entity
 public class RepositoryInfo {
 
@@ -18,6 +20,12 @@ public class RepositoryInfo {
     private Integer stars;
     private String language;
     private String defaultBranch;
+    private String indexingStatus = "NOT_INDEXED";
+    private Integer indexingProgress = 0;
+    private Integer indexedChunks = 0;
+    private LocalDateTime indexingStartedAt;
+    private LocalDateTime indexingCompletedAt;
+    private String indexingError;
 
     public Integer getStars() {
         return stars;
@@ -72,5 +80,53 @@ public class RepositoryInfo {
 
     public void setDescription(String description) {
         this.description = description;
+    }
+
+    public String getIndexingStatus() {
+        return indexingStatus;
+    }
+
+    public void setIndexingStatus(String indexingStatus) {
+        this.indexingStatus = indexingStatus;
+    }
+
+    public Integer getIndexingProgress() {
+        return indexingProgress;
+    }
+
+    public void setIndexingProgress(Integer indexingProgress) {
+        this.indexingProgress = indexingProgress;
+    }
+
+    public Integer getIndexedChunks() {
+        return indexedChunks;
+    }
+
+    public void setIndexedChunks(Integer indexedChunks) {
+        this.indexedChunks = indexedChunks;
+    }
+
+    public LocalDateTime getIndexingStartedAt() {
+        return indexingStartedAt;
+    }
+
+    public void setIndexingStartedAt(LocalDateTime indexingStartedAt) {
+        this.indexingStartedAt = indexingStartedAt;
+    }
+
+    public LocalDateTime getIndexingCompletedAt() {
+        return indexingCompletedAt;
+    }
+
+    public void setIndexingCompletedAt(LocalDateTime indexingCompletedAt) {
+        this.indexingCompletedAt = indexingCompletedAt;
+    }
+
+    public String getIndexingError() {
+        return indexingError;
+    }
+
+    public void setIndexingError(String indexingError) {
+        this.indexingError = indexingError;
     }
 }
