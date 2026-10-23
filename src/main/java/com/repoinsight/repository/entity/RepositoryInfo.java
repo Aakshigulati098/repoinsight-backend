@@ -11,7 +11,6 @@ import java.time.LocalDateTime;
 public class RepositoryInfo {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
     private String name;
@@ -56,6 +55,10 @@ public class RepositoryInfo {
 
     public Long getId() {
         return id;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
     }
 
     public String getName() {

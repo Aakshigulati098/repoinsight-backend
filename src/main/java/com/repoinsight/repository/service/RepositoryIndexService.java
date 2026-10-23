@@ -43,6 +43,26 @@ public class RepositoryIndexService {
                 .build();
     }
 
+    public Long findSmallestAvailableId() {
+        List<RepositoryInfo> repositories =
+                repositoryInfoRepository.findAll(
+                        org.springframework.data.domain.Sort.by("id")
+                );
+
+        long expectedId = 1;
+
+        for (RepositoryInfo repository : repositories) {
+            long currentId = repository.getId();
+
+            if (currentId == expectedId) {
+                expectedId++;
+            } else if (currentId > expectedId) {
+                break;
+            }
+        }
+
+        return expectedId;
+    }
 
     @Async("indexingExecutor")
     public CompletableFuture<Integer> indexRepositoryAsync(Long repositoryId) {

@@ -17,14 +17,17 @@ public class RepositoryInfoService {
     private final RepositoryInfoRepository repositoryInfoRepository;
     private final AnalysisReportRepository analysisReportRepository;
     private final GithubClientService githubClientService;
+    private final RepositoryIndexService repositoryIndexService;
 
     public RepositoryInfoService(
             RepositoryInfoRepository repositoryInfoRepository,
             AnalysisReportRepository analysisReportRepository,
-            GithubClientService githubClientService) {
+            GithubClientService githubClientService,
+            RepositoryIndexService repositoryIndexService) {
         this.repositoryInfoRepository = repositoryInfoRepository;
         this.analysisReportRepository = analysisReportRepository;
         this.githubClientService = githubClientService;
+        this.repositoryIndexService = repositoryIndexService;
     }
 
     public RepositoryInfo saveRepository(RepositoryInfo repositoryInfo) {
@@ -67,6 +70,8 @@ public class RepositoryInfoService {
                 githubClientService.fetchRepository(request.githubUrl());
 
         RepositoryInfo repository = new RepositoryInfo();
+
+        repository.setId(repositoryIndexService.findSmallestAvailableId());
         repository.setName(github.name());
         repository.setGithubUrl(github.htmlUrl());
         repository.setDescription(github.description());

@@ -29,6 +29,9 @@ class RepositoryInfoServiceTest {
     @Mock
     private GithubClientService githubClientService;
 
+    @Mock
+    private RepositoryIndexService repositoryIndexService;
+
     @InjectMocks
     private RepositoryInfoService service;
 
@@ -98,6 +101,7 @@ class RepositoryInfoServiceTest {
                 "main");
 
         when(githubClientService.fetchRepository(request.githubUrl())).thenReturn(githubResponse);
+        when(repositoryIndexService.findSmallestAvailableId()).thenReturn(1L);
         when(repositoryInfoRepository.save(any(RepositoryInfo.class))).thenAnswer(invocation -> invocation.getArgument(0));
 
         RepositoryInfo imported = service.importFromGitHub(request);
@@ -108,6 +112,7 @@ class RepositoryInfoServiceTest {
         assertThat(imported.getStars()).isEqualTo(120);
         assertThat(imported.getLanguage()).isEqualTo("Java");
         assertThat(imported.getDefaultBranch()).isEqualTo("main");
+        assertThat(imported.getId()).isEqualTo(1L);
     }
 
     @Test
