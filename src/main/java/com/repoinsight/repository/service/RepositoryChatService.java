@@ -10,8 +10,6 @@ import tools.jackson.databind.JsonNode;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -25,10 +23,10 @@ import java.util.regex.Pattern;
 @Service
 public class RepositoryChatService {
 
-    private static final int MAX_FILES = 10;
-    private static final int MAX_SEED_FILES = 6;
-    private static final int MAX_FILE_CHARS = 8000;
-    private static final int MAX_CONTEXT_CHARS = 18000;
+    private static final int MAX_FILES = 14;
+    private static final int MAX_SEED_FILES = 8;
+    private static final int MAX_FILE_CHARS = 6000;
+    private static final int MAX_CONTEXT_CHARS = 16000;
     private static final Pattern JAVA_IMPORT = Pattern.compile(
             "(?m)^\\s*import\\s+(?:static\\s+)?([\\w.]+)(\\.\\*)?\\s*;");
     private static final Pattern PACKAGE_DECLARATION = Pattern.compile(
@@ -161,19 +159,18 @@ public class RepositoryChatService {
             // Follow explicit Java imports to pull in services, repositories,
             // DTOs, entities, and other project classes related to the seed files.
             if (path.endsWith(".java")) {
+                // Resolve explicit imports first.
                 for (String importedClass : importedSimpleNames(content)) {
-                    List<String> matchingPaths = pathsByClassName.get(importedClass);
-                    if (matchingPaths == null) {
-                        continue;
-                    }
-                    for (String dependencyPath : matchingPaths) {
-                        if (queued.size() >= MAX_FILES) {
-                            break;
-                        }
-                        if (queued.add(dependencyPath)) {
-                            pending.addLast(dependencyPath);
-                        }
-                    }
+                    enqueueClassPaths(importedClass, pathsByClassName, queued, pending);
+                }
+
+                // Java permits references to types in the same package without imports.
+                // This is crucial for repositories such as Spring PetClinic, where a
+                // controller and its repository may share a package. Follow types named
+                // in constructor parameters instead of filling the file budget with
+                // unrelated controllers or entities.
+                for (String parameterType : constructorParameterTypeNames(content)) {
+                    enqueueClassPaths(parameterType, pathsByClassName, queued, pending);
                 }
 
                 // Resolve wildcard package imports against Java source paths.
@@ -209,8 +206,11 @@ public class RepositoryChatService {
                 You are RepoInsight, a source-grounded code analysis assistant.
                 Use only the supplied source. Include citations in the format
                 `path/to/File.java:12-16` for important repository-specific claims. Do not
-                invent files, annotations, fields, constructors, or relationships. If the
-                retrieved source does not establish a point, say so explicitly.
+                invent files, annotations, fields, constructors, or relationships. Every
+                answer must include at least one exact citation in the form
+                `src/main/java/package/Class.java:12-16`. Put the citation on the same
+                bullet or sentence as the claim. If the retrieved source does not establish
+                a point, say so explicitly and cite the closest relevant source evidence.
 
                 Never invent or transfer annotations, fields, constructors, or relationships
                 between classes. An import, filename, inheritance, or method name alone does
@@ -283,12 +283,10 @@ public class RepositoryChatService {
         }
 
         if (!validationErrors.isEmpty()) {
-            // Preserve the model's explanation instead of replacing it with a canned evidence
-            // dump. Mark it as partially verified and expose diagnostics for debugging.
-            answer = (answer == null ? "" : answer)
-                    + "\n\n**Verification note:** Some citations could not be validated automatically. "
-                    + "Treat repository-specific claims as partially verified until checked against source."
-                    + "\n\nValidation diagnostics: " + String.join("; ", validationErrors);
+            // Fail closed: do not return an unverified model explanation as if it were grounded.
+            // The fallback is generated directly from retrieved source lines and cannot invent
+            // dependency relationships. Keep diagnostics in server logs, not in user-facing prose.
+            answer = buildValidationFallback(sources, validationErrors, question);
         }
 
         return Map.of(
@@ -358,64 +356,104 @@ public class RepositoryChatService {
     }
 
     private String buildValidationFallback(
-            Map<String, String> sources, List<String> validationErrors) {
+            Map<String, String> sources, List<String> validationErrors, String question) {
         StringBuilder fallback = new StringBuilder();
-        fallback.append("I couldn't safely validate a generated explanation, so here is the ")
-                .append("source evidence found directly in the retrieved files. ")
-                .append("These are observations about the exact lines, not inferred wiring.\n\n");
+        String q = question == null ? "" : question.toLowerCase(Locale.ROOT);
+        boolean dependencyQuestion = q.contains("dependency") || q.contains("inject")
+                || q.contains("autowired") || q.contains("wiring") || q.contains("bean");
+
+        if (dependencyQuestion) {
+            fallback.append("Dependency-injection evidence found in the retrieved source:\n\n");
+        } else {
+            fallback.append("I couldn't verify the generated explanation against exact source citations. ")
+                    .append("Here is the relevant evidence found in the retrieved files:\n\n");
+        }
 
         boolean foundEvidence = false;
         for (Map.Entry<String, String> entry : sources.entrySet()) {
             String path = entry.getKey();
+            if (!path.endsWith(".java")) {
+                continue;
+            }
+
             String[] lines = entry.getValue().split("\\R", -1);
-            List<Integer> evidenceLineNumbers = new ArrayList<>();
+            List<Integer> stereotypeLines = new ArrayList<>();
+            List<Integer> constructorLines = new ArrayList<>();
+            List<Integer> injectionLines = new ArrayList<>();
+            String className = fileNameWithoutExtension(path);
 
             for (int i = 0; i < lines.length; i++) {
                 String line = lines[i].trim();
                 if (line.isEmpty() || line.startsWith("//") || line.startsWith("*")) {
                     continue;
                 }
-                if (INJECTION_ANNOTATION.matcher(line).find()
-                        || JPA_ANNOTATION.matcher(line).find()
-                        || line.contains("@ImportRuntimeHints")
-                        || line.contains("@ServiceConnection")
-                        || line.contains("@Profile")
-                        || line.contains("@Bean")
-                        || line.contains("@Configuration")
-                        || line.contains("@SpringBootApplication")) {
-                    evidenceLineNumbers.add(i + 1);
+
+                if (line.contains("@Controller") || line.contains("@RestController")
+                        || line.contains("@Service") || line.contains("@Component")
+                        || line.contains("@Repository") || line.contains("@Configuration")) {
+                    stereotypeLines.add(i + 1);
+                }
+                if (INJECTION_ANNOTATION.matcher(line).find()) {
+                    injectionLines.add(i + 1);
+                }
+                if (line.matches("^(public|protected|private)?\\s*"
+                        + Pattern.quote(className) + "\\s*\\(.*")) {
+                    constructorLines.add(i + 1);
                 }
             }
 
-            if (evidenceLineNumbers.isEmpty()) {
+            if (stereotypeLines.isEmpty() && constructorLines.isEmpty()
+                    && injectionLines.isEmpty()) {
                 continue;
             }
 
             foundEvidence = true;
-            fallback.append("**`").append(path).append("`**\n");
-            for (Integer lineNumber : evidenceLineNumbers) {
-                String line = lines[lineNumber - 1].trim();
-                fallback.append("- `").append(path).append(":")
-                        .append(lineNumber).append("` — `")
-                        .append(line.replace("`", "'")).append("`\n");
+            fallback.append(path).append('\n');
+
+            for (Integer lineNumber : stereotypeLines) {
+                fallback.append("  ").append(path).append(":").append(lineNumber)
+                        .append(" — ").append(lines[lineNumber - 1].trim()).append('\n');
+            }
+            for (Integer lineNumber : constructorLines) {
+                String constructorLine = lines[lineNumber - 1].trim();
+                fallback.append("  ").append(path).append(":").append(lineNumber)
+                        .append(" — ").append(constructorLine).append('\n');
+
+                if (dependencyQuestion) {
+                    int openParen = constructorLine.indexOf('(');
+                    int closeParen = constructorLine.lastIndexOf(')');
+                    if (openParen >= 0 && closeParen > openParen) {
+                        String parameters = constructorLine.substring(openParen + 1, closeParen).trim();
+                        if (!parameters.isEmpty()) {
+                            fallback.append("  Declared constructor parameter(s): ")
+                                    .append(parameters).append('\n');
+                        }
+                    }
+                }
+            }
+            for (Integer lineNumber : injectionLines) {
+                fallback.append("  ").append(path).append(":").append(lineNumber)
+                        .append(" — ").append(lines[lineNumber - 1].trim()).append('\n');
             }
             fallback.append('\n');
         }
 
         if (!foundEvidence) {
-            fallback.append("No matching injection, configuration, runtime-hint, or JPA ")
-                    .append("annotations were detected by the source scanner. This does not ")
-                    .append("prove that no relevant wiring exists; inspect the retrieved ")
-                    .append("files or broaden source retrieval.\n\n");
+            fallback.append("No matching Spring stereotype, constructor, or explicit injection ")
+                    .append("annotation was detected in the retrieved Java files. This may mean ")
+                    .append("the relevant source file was not retrieved; it does not prove that ")
+                    .append("the repository has no dependency injection.\n");
+        } else if (dependencyQuestion) {
+            fallback.append("How to read this evidence:\n");
+            fallback.append("- A Spring stereotype such as @Controller, @Service, or @Repository ")
+                    .append("marks a class for Spring management.\n");
+            fallback.append("- A constructor parameter in such a class is evidence of a declared ")
+                    .append("dependency. If this is the class's only constructor, Spring can use ")
+                    .append("constructor injection without an explicit @Autowired annotation.\n");
+            fallback.append("- @Autowired, @Inject, or @Resource on a field, method, or constructor ")
+                    .append("is explicit injection evidence. Do not treat @PathVariable, @ModelAttribute, ")
+                    .append("@Valid, or JPA mapping annotations as dependency-injection annotations.\n");
         }
-
-        fallback.append("**Interpretation guardrails:** `@ImportRuntimeHints` registers runtime ")
-                .append("hints; `@Configuration` and `@Bean` define configuration/beans; ")
-                .append("`@Profile` conditions bean registration on a profile; JPA annotations ")
-                .append("such as `@Entity`, `@MappedSuperclass`, and `@ManyToMany` describe ")
-                .append("persistence mapping. These categories are not interchangeable. ")
-                .append("The listed source lines alone do not establish an unshown dependency ")
-                .append("injection relationship.");
 
         return fallback.toString().trim();
     }
@@ -429,6 +467,53 @@ public class RepositoryChatService {
             // Skip inaccessible files; continue building the available context.
             return null;
         }
+    }
+
+
+    private void enqueueClassPaths(
+            String className,
+            Map<String, List<String>> pathsByClassName,
+            Set<String> queued,
+            Deque<String> pending) {
+        List<String> matchingPaths = pathsByClassName.get(className);
+        if (matchingPaths == null) return;
+        for (String dependencyPath : matchingPaths) {
+            if (queued.size() >= MAX_FILES) break;
+            if (queued.add(dependencyPath)) pending.addLast(dependencyPath);
+        }
+    }
+
+    /** Extracts declared types from simple Java constructor parameter lists. */
+    private Set<String> constructorParameterTypeNames(String source) {
+        Set<String> types = new LinkedHashSet<>();
+        Matcher classMatcher = TYPE_DECLARATION.matcher(source);
+        while (classMatcher.find()) {
+            String className = classMatcher.group(1);
+            Pattern constructorPattern = Pattern.compile(
+                    "(?:public|protected|private)?\\s*" + Pattern.quote(className)
+                            + "\\s*\\(([^)]*)\\)");
+            Matcher constructorMatcher = constructorPattern.matcher(source);
+            while (constructorMatcher.find()) {
+                String parameters = constructorMatcher.group(1).trim();
+                if (parameters.isEmpty()) continue;
+                for (String parameter : parameters.split(",")) {
+                    String cleaned = parameter
+                            .replaceAll("@\\w+(?:\\([^)]*\\))?\\s*", "")
+                            .replaceAll("\\bfinal\\s+", "")
+                            .trim();
+                    String[] tokens = cleaned.split("\\s+");
+                    if (tokens.length >= 2) {
+                        String type = tokens[tokens.length - 2]
+                                .replaceAll("<.*>", "")
+                                .replaceAll("\\[\\]", "");
+                        int dot = type.lastIndexOf('.');
+                        if (dot >= 0) type = type.substring(dot + 1);
+                        if (type.matches("[A-Z_$][A-Za-z0-9_$]*")) types.add(type);
+                    }
+                }
+            }
+        }
+        return types;
     }
 
     private Set<String> importedSimpleNames(String content) {
