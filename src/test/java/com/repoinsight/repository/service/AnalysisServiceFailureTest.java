@@ -63,7 +63,8 @@ class AnalysisServiceFailureTest {
 
         assertEquals(AnalysisStatus.FAILED, result.getStatus());
         verify(analysisReportRepository, atLeastOnce()).save(report);
-        verify(githubClientService, never()).analyzeTree(anyString(), anyString());
+        verify(githubClientService, times(1))
+                .analyzeTree(repository.getGithubUrl(), repository.getDefaultBranch());
         verifyNoInteractions(aiSummaryService);
     }
 

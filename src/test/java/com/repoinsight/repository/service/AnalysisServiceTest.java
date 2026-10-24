@@ -127,7 +127,7 @@ class AnalysisServiceTest {
                 .thenReturn(new RepositoryTreeResponse(1, List.of(), List.of(), List.of("README.md"), false));
         when(aiSummaryService.generateSummary(
                 "demo-repo", "Demo repository", "# Demo", "[]", "[]"))
-                .thenThrow(new IllegalStateException("Gemini unavailable"));
+                .thenThrow(new IllegalStateException("AI model unavailable"));
 
         AnalysisReport result = service.analyzeRepository(7L);
 

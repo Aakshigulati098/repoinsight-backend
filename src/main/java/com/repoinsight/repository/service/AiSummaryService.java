@@ -34,12 +34,16 @@ public class AiSummaryService {
                 README:
                 %s
 
-                Produce a concise, focused report with these sections:
+                Produce a detailed, focused report of about 350-450 words with
+                these sections:
                 1. Project Overview
                 2. Main Features
                 3. Technology Stack
                 4. Likely Architecture
                 5. Getting Started
+
+                Include useful evidence-based details under every section and
+                avoid repeating the same information.
 
                 Do not invent features, dependencies, or architecture.
                 Mark uncertain conclusions as assumptions.
@@ -117,6 +121,9 @@ public class AiSummaryService {
         24. Include a component only when it adds useful architectural
             information; avoid listing technologies without relationships.
         25. Ensure node IDs are unique and every referenced node exists.
+        26. Use only simple flowchart syntax: ID["Short label"] and A --> B.
+        27. Do not use parentheses, braces, subgraphs, semicolons, or Markdown.
+        28. Use "flowchart TD" as the first line, not "graph".
 
         Example structure (use only if supported by evidence):
 

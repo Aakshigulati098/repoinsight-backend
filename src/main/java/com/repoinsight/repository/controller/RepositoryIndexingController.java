@@ -63,11 +63,12 @@ public class RepositoryIndexingController {
     public ResponseEntity<Map<String, Object>> indexRepository(
             @PathVariable("id") Long id) {
 
+        repositoryIndexService.prepareIndexing(id);
         repositoryIndexService.indexRepositoryAsync(id);
 
         return ResponseEntity.accepted().body(Map.of(
                 "repositoryId", id,
-                "status", "IN_PROGRESS",
+                "status", "PENDING",
                 "message", "Repository indexing has been started"
         ));
     }
@@ -86,8 +87,10 @@ public class RepositoryIndexingController {
         Map<String, Object> response = new HashMap<>();
         response.put("repositoryId", repository.getId());
         response.put("status", repository.getIndexingStatus());
+        response.put("stage", repository.getIndexingStage());
         response.put("progress", repository.getIndexingProgress());
         response.put("chunksIndexed", repository.getIndexedChunks());
+        response.put("totalChunks", repository.getIndexingTotalChunks());
         response.put("startedAt", repository.getIndexingStartedAt());
         response.put("completedAt", repository.getIndexingCompletedAt());
         response.put("error", repository.getIndexingError());

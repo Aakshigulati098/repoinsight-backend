@@ -39,15 +39,16 @@ public class AnalysisExecutionService {
 
         var repository = report.getRepositoryInfo();
 
-        // Step 1: Fetch README.
-        String readme = gitHubClientService.fetchReadme(
-                repository.getGithubUrl());
-
-        // Step 2: Analyze repository file tree.
-        RepositoryTreeResponse tree =
+        // These GitHub requests are independent, so fetch them concurrently.
+        var readmeFuture = java.util.concurrent.CompletableFuture.supplyAsync(() ->
+                gitHubClientService.fetchReadme(repository.getGithubUrl()));
+        var treeFuture = java.util.concurrent.CompletableFuture.supplyAsync(() ->
                 gitHubClientService.analyzeTree(
                         repository.getGithubUrl(),
-                        repository.getDefaultBranch());
+                        repository.getDefaultBranch()));
+
+        String readme = readmeFuture.join();
+        RepositoryTreeResponse tree = treeFuture.join();
 
         // Step 3: Save repository analysis data.
         report.setReadmeContent(readme);
@@ -57,7 +58,6 @@ public class AnalysisExecutionService {
         report.setSampleFilePaths(toJsonArray(tree.sampleFilePaths()));
         report.setTreeTruncated(tree.truncated());
 
-        // Steps 4 & 5: Generate AI summary and architecture diagram in parallel for maximum speed.
         var summaryFuture = java.util.concurrent.CompletableFuture.supplyAsync(() ->
                 aiSummaryService.generateSummary(
                         repository.getName(),
@@ -65,7 +65,6 @@ public class AnalysisExecutionService {
                         report.getReadmeContent(),
                         report.getTechnologies(),
                         report.getImportantFiles()));
-
         var diagramFuture = java.util.concurrent.CompletableFuture.supplyAsync(() ->
                 aiSummaryService.generateArchitectureDiagram(
                         repository.getName(),

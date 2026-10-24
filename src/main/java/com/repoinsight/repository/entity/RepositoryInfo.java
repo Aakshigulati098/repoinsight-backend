@@ -27,8 +27,10 @@ public class RepositoryInfo {
     private String license;
     private String topics;
     private String indexingStatus = "NOT_INDEXED";
+    private String indexingStage;
     private Integer indexingProgress = 0;
     private Integer indexedChunks = 0;
+    private Integer indexingTotalChunks = 0;
     private LocalDateTime indexingStartedAt;
     private LocalDateTime indexingCompletedAt;
     private String indexingError;
@@ -100,6 +102,14 @@ public class RepositoryInfo {
         this.indexingStatus = indexingStatus;
     }
 
+    public String getIndexingStage() {
+        return indexingStage;
+    }
+
+    public void setIndexingStage(String indexingStage) {
+        this.indexingStage = indexingStage;
+    }
+
     public Integer getIndexingProgress() {
         return indexingProgress;
     }
@@ -114,6 +124,14 @@ public class RepositoryInfo {
 
     public void setIndexedChunks(Integer indexedChunks) {
         this.indexedChunks = indexedChunks;
+    }
+
+    public Integer getIndexingTotalChunks() {
+        return indexingTotalChunks;
+    }
+
+    public void setIndexingTotalChunks(Integer indexingTotalChunks) {
+        this.indexingTotalChunks = indexingTotalChunks;
     }
 
     public LocalDateTime getIndexingStartedAt() {
