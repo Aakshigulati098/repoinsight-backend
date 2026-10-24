@@ -57,26 +57,25 @@ public class AnalysisExecutionService {
         report.setSampleFilePaths(toJsonArray(tree.sampleFilePaths()));
         report.setTreeTruncated(tree.truncated());
 
-        // Step 4: Generate AI summary.
-        String summary = aiSummaryService.generateSummary(
-                repository.getName(),
-                repository.getDescription(),
-                report.getReadmeContent(),
-                report.getTechnologies(),
-                report.getImportantFiles());
+        // Steps 4 & 5: Generate AI summary and architecture diagram in parallel for maximum speed.
+        var summaryFuture = java.util.concurrent.CompletableFuture.supplyAsync(() ->
+                aiSummaryService.generateSummary(
+                        repository.getName(),
+                        repository.getDescription(),
+                        report.getReadmeContent(),
+                        report.getTechnologies(),
+                        report.getImportantFiles()));
 
-        report.setAiSummary(summary);
-
-        // Step 5: Generate architecture diagram.
-        String diagram =
+        var diagramFuture = java.util.concurrent.CompletableFuture.supplyAsync(() ->
                 aiSummaryService.generateArchitectureDiagram(
                         repository.getName(),
                         repository.getDescription(),
                         report.getReadmeContent(),
                         report.getTechnologies(),
-                        report.getImportantFiles());
+                        report.getImportantFiles()));
 
-        report.setArchitectureDiagram(diagram);
+        report.setAiSummary(summaryFuture.join());
+        report.setArchitectureDiagram(diagramFuture.join());
         report.setStatus(AnalysisStatus.COMPLETED);
 
         return analysisReportRepository.save(report);

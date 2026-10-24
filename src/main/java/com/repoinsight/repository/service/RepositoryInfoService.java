@@ -79,6 +79,22 @@ public class RepositoryInfoService {
         repository.setLanguage(github.language());
         repository.setDefaultBranch(github.defaultBranch());
 
+        if (github.owner() != null) {
+            repository.setOwnerName(github.owner().login());
+            repository.setOwnerAvatarUrl(github.owner().avatarUrl());
+            repository.setOwnerUrl(github.owner().htmlUrl());
+        }
+        repository.setForks(github.forks() != null ? github.forks() : 0);
+        repository.setOpenIssues(github.openIssues() != null ? github.openIssues() : 0);
+        if (github.license() != null) {
+            repository.setLicense(github.license().spdxId() != null && !github.license().spdxId().isBlank()
+                    ? github.license().spdxId()
+                    : github.license().name());
+        }
+        if (github.topics() != null && !github.topics().isEmpty()) {
+            repository.setTopics(String.join(",", github.topics()));
+        }
+
         return repositoryInfoRepository.save(repository);
     }
 }

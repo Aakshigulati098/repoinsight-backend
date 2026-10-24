@@ -20,12 +20,7 @@ public class AiSummaryService {
             String technologies,
             String importantFiles) {
 
-        // Limit input size to avoid sending an excessively
-        // large README to the model.
-        String safeReadme = readme == null
-                ? "README not available"
-                : readme.substring(
-                0, Math.min(readme.length(), 12000));
+        String safeReadme = sanitizeReadme(readme, 3500);
 
         String prompt = """
                 Analyze this GitHub repository using only
@@ -39,7 +34,7 @@ public class AiSummaryService {
                 README:
                 %s
 
-                Produce a concise report with these sections:
+                Produce a concise, focused report with these sections:
                 1. Project Overview
                 2. Main Features
                 3. Technology Stack
@@ -72,10 +67,7 @@ public class AiSummaryService {
             String technologies,
             String importantFiles) {
 
-        String safeReadme = readme == null
-                ? "README not available"
-                : readme.substring(0, Math.min(readme.length(), 10000));
-
+        String safeReadme = sanitizeReadme(readme, 3000);
 
         String prompt = """
         Create a Mermaid flowchart describing the architecture
@@ -176,5 +168,16 @@ public class AiSummaryService {
         return diagram;
     }
 
-
+    private String sanitizeReadme(String readme, int maxLength) {
+        if (readme == null || readme.isBlank()) {
+            return "README not available";
+        }
+        String clean = readme
+                .replaceAll("(?i)<img[^>]*>", "")
+                .replaceAll("(?i)<[^>]+>", " ")
+                .replaceAll("!\\[[^\\]]*\\]\\([^)]*\\)", "")
+                .replaceAll("\\n{3,}", "\n\n")
+                .trim();
+        return clean.substring(0, Math.min(clean.length(), maxLength));
+    }
 }

@@ -19,6 +19,13 @@ public class RepositoryInfo {
     private Integer stars;
     private String language;
     private String defaultBranch;
+    private String ownerName;
+    private String ownerAvatarUrl;
+    private String ownerUrl;
+    private Integer forks = 0;
+    private Integer openIssues = 0;
+    private String license;
+    private String topics;
     private String indexingStatus = "NOT_INDEXED";
     private Integer indexingProgress = 0;
     private Integer indexedChunks = 0;
@@ -131,5 +138,85 @@ public class RepositoryInfo {
 
     public void setIndexingError(String indexingError) {
         this.indexingError = indexingError;
+    }
+
+    public String getOwnerName() {
+        if (ownerName != null && !ownerName.isBlank()) {
+            return ownerName;
+        }
+        if (githubUrl != null && githubUrl.contains("github.com/")) {
+            String path = githubUrl.replaceFirst("^https?://[^/]+/", "");
+            String[] parts = path.split("/");
+            if (parts.length > 0 && !parts[0].isBlank()) {
+                return parts[0];
+            }
+        }
+        return null;
+    }
+
+    public void setOwnerName(String ownerName) {
+        this.ownerName = ownerName;
+    }
+
+    public String getOwnerAvatarUrl() {
+        if (ownerAvatarUrl != null && !ownerAvatarUrl.isBlank()) {
+            return ownerAvatarUrl;
+        }
+        String owner = getOwnerName();
+        if (owner != null && !owner.isBlank()) {
+            return "https://github.com/" + owner + ".png";
+        }
+        return null;
+    }
+
+    public void setOwnerAvatarUrl(String ownerAvatarUrl) {
+        this.ownerAvatarUrl = ownerAvatarUrl;
+    }
+
+    public String getOwnerUrl() {
+        if (ownerUrl != null && !ownerUrl.isBlank()) {
+            return ownerUrl;
+        }
+        String owner = getOwnerName();
+        if (owner != null && !owner.isBlank()) {
+            return "https://github.com/" + owner;
+        }
+        return null;
+    }
+
+    public void setOwnerUrl(String ownerUrl) {
+        this.ownerUrl = ownerUrl;
+    }
+
+    public Integer getForks() {
+        return forks != null ? forks : 0;
+    }
+
+    public void setForks(Integer forks) {
+        this.forks = forks;
+    }
+
+    public Integer getOpenIssues() {
+        return openIssues != null ? openIssues : 0;
+    }
+
+    public void setOpenIssues(Integer openIssues) {
+        this.openIssues = openIssues;
+    }
+
+    public String getLicense() {
+        return license;
+    }
+
+    public void setLicense(String license) {
+        this.license = license;
+    }
+
+    public String getTopics() {
+        return topics;
+    }
+
+    public void setTopics(String topics) {
+        this.topics = topics;
     }
 }
