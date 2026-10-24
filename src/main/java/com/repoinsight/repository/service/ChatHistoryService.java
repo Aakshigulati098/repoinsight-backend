@@ -86,6 +86,16 @@ public class ChatHistoryService {
         return getChatDetails(conversation);
     }
 
+    @Transactional
+    public void deleteChat(Long conversationId) {
+        if (!conversationRepository.existsById(conversationId)) {
+            throw new IllegalArgumentException(
+                    "Chat not found: " + conversationId);
+        }
+        messageRepository.deleteByConversation_Id(conversationId);
+        conversationRepository.deleteById(conversationId);
+    }
+
     private void saveExchange(ChatConversation conversation, String question) {
         Map<String, Object> result = repositoryChatService.ask(
                 conversation.getRepositoryInfo().getId(), question);

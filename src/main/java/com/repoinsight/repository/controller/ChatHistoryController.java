@@ -1,6 +1,7 @@
 package com.repoinsight.repository.controller;
 
 import com.repoinsight.repository.service.ChatHistoryService;
+import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -26,5 +27,11 @@ public class ChatHistoryController {
             @PathVariable Long chatId,
             @RequestBody Map<String, String> request) {
         return chatHistoryService.sendMessage(chatId, request.get("question"));
+    }
+
+    @DeleteMapping("/{chatId}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void deleteChat(@PathVariable Long chatId) {
+        chatHistoryService.deleteChat(chatId);
     }
 }
