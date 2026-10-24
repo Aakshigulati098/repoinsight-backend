@@ -25,16 +25,16 @@ class RepositoryIndexServiceTest {
 
     @Test
     void chunkContentUsesModelCompatibleOverlappingChunks() {
-        String content = "a".repeat(700);
+        String content = "a".repeat(2000);
 
         var chunks = RepositoryIndexService.chunkContent(content);
 
         assertThat(chunks).hasSize(3);
-        assertThat(chunks.get(0)).hasSize(300);
-        assertThat(chunks.get(1)).hasSize(300);
-        assertThat(chunks.get(2)).hasSize(200);
-        assertThat(chunks).allSatisfy(chunk -> assertThat(chunk.length()).isLessThanOrEqualTo(300));
-        assertThat(chunks.get(0).substring(250))
+        assertThat(chunks.get(0)).hasSize(900);
+        assertThat(chunks.get(1)).hasSize(900);
+        assertThat(chunks.get(2)).hasSize(300);
+        assertThat(chunks).allSatisfy(chunk -> assertThat(chunk.length()).isLessThanOrEqualTo(900));
+        assertThat(chunks.get(0).substring(850))
                 .isEqualTo(chunks.get(1).substring(0, 50));
     }
 
@@ -88,6 +88,15 @@ class RepositoryIndexServiceTest {
     @Test
     void chunkContentReturnsNoChunksForBlankContent() {
         assertThat(RepositoryIndexService.chunkContent(" \n\t")).isEmpty();
+    }
+
+    @Test
+    void estimatedChunkCountAccountsForChunkOverlap() {
+        assertThat(RepositoryIndexService.estimateChunkCount(0)).isZero();
+        assertThat(RepositoryIndexService.estimateChunkCount(900)).isEqualTo(1);
+        assertThat(RepositoryIndexService.estimateChunkCount(901)).isEqualTo(2);
+        assertThat(RepositoryIndexService.estimateChunkCount(1750)).isEqualTo(2);
+        assertThat(RepositoryIndexService.estimateChunkCount(1751)).isEqualTo(3);
     }
 
     @Test

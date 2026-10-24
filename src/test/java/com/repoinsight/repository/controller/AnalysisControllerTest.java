@@ -7,7 +7,6 @@ import com.repoinsight.repository.kafka.AnalysisRequestProducer;
 import com.repoinsight.repository.repository.AnalysisReportRepository;
 import com.repoinsight.repository.service.AnalysisService;
 import org.junit.jupiter.api.Test;
-import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.web.server.ResponseStatusException;
 
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -24,11 +23,10 @@ class AnalysisControllerTest {
         AnalysisController controller = new AnalysisController(producer, reportRepository, service);
 
         AnalysisReport report = new AnalysisReport();
-        ReflectionTestUtils.setField(report, "id", 101L);
+        report.setId(101L);
         report.setStatus(AnalysisStatus.PENDING);
         RepositoryInfo repository = new RepositoryInfo();
         report.setRepositoryInfo(repository);
-        // The generated ID is normally assigned by JPA; this unit test verifies the call path.
         when(service.createPendingReport(5L)).thenReturn(report);
 
         controller.analyzeRepository(5L);
@@ -45,7 +43,7 @@ class AnalysisControllerTest {
         AnalysisController controller = new AnalysisController(producer, reportRepository, service);
 
         AnalysisReport report = new AnalysisReport();
-        ReflectionTestUtils.setField(report, "id", 102L);
+        report.setId(102L);
         when(service.createPendingReport(5L)).thenReturn(report);
         doThrow(new IllegalStateException("Kafka unavailable"))
                 .when(producer).sendAnalysisRequest(report.getId());

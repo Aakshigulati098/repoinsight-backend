@@ -28,9 +28,9 @@ import java.util.concurrent.Executors;
 @Service
 public class RepositoryIndexService {
 
-    private static final int MAX_CHUNK_CHARS = 300;
+    private static final int MAX_CHUNK_CHARS = 900;
     private static final int CHUNK_OVERLAP_CHARS = 50;
-    private static final int MAX_DOCUMENTS_PER_BATCH = 16;
+    private static final int MAX_DOCUMENTS_PER_BATCH = 128;
     private static final int MAX_CONCURRENT_DOWNLOADS = 8;
     private static final Set<String> EXCLUDED_PATH_SEGMENTS = Set.of(
             ".git",
@@ -208,130 +208,160 @@ public class RepositoryIndexService {
                     "No indexable source files were found.");
         }
 
+        long estimatedTotalChunks = indexableFiles.stream()
+                .mapToLong(item -> estimateChunkCount(
+                        item.path("size").asLong(0)))
+                .sum();
+        int statusTotalChunks = (int) Math.min(
+                estimatedTotalChunks, Integer.MAX_VALUE);
+        String indexVersion = UUID.randomUUID().toString();
+        int indexedDocuments = 0;
+        int lastProgress = 5;
+        boolean embeddingStageStarted = false;
+        List<Document> documentBatch =
+                new ArrayList<>(MAX_DOCUMENTS_PER_BATCH);
         updateStatus(
                 repository,
                 "IN_PROGRESS",
                 5,
                 0,
-                0,
+                statusTotalChunks,
                 "Downloading source files",
                 null);
-
-        // Keep the current index available until every batch in this run succeeds.
-        String indexVersion = UUID.randomUUID().toString();
-        List<Document> documents = new ArrayList<>();
-        try (var downloadExecutor =
-                     Executors.newVirtualThreadPerTaskExecutor()) {
-            for (int offset = 0; offset < indexableFiles.size();
-                    offset += MAX_CONCURRENT_DOWNLOADS) {
-                int batchEnd = Math.min(
-                        offset + MAX_CONCURRENT_DOWNLOADS,
-                        indexableFiles.size());
-                List<CompletableFuture<DownloadedFile>> downloads =
-                        new ArrayList<>(batchEnd - offset);
-
-                for (int fileIndex = offset; fileIndex < batchEnd; fileIndex++) {
-                    String path = indexableFiles.get(fileIndex)
-                            .path("path").asText();
-                    downloads.add(CompletableFuture.supplyAsync(
-                            () -> downloadFile(owner, repo, finalBranch, path),
-                            downloadExecutor));
-                }
-
-                for (int fileIndex = offset; fileIndex < batchEnd; fileIndex++) {
-                    DownloadedFile downloaded;
-                    try {
-                        downloaded = downloads.get(fileIndex - offset).join();
-                    } catch (CompletionException exception) {
-                        if (exception.getCause() instanceof RuntimeException cause) {
-                            throw cause;
-                        }
-                        throw exception;
-                    }
-
-                    if (downloaded.content() != null
-                            && !downloaded.content().isBlank()) {
-                        List<String> chunks = chunkContent(downloaded.content());
-                        for (int chunkNumber = 0;
-                                chunkNumber < chunks.size();
-                                chunkNumber++) {
-                            documents.add(new Document(
-                                    chunks.get(chunkNumber),
-                                    Map.of(
-                                            "repositoryId", repositoryId,
-                                            "repositoryName", repository.getName(),
-                                            "filePath", downloaded.path(),
-                                            "chunkNumber", chunkNumber,
-                                            "indexVersion", indexVersion
-                                    )
-                            ));
-                        }
-                    }
-
-                }
-
-                int progress = 5 + (int) ((long) batchEnd * 40
-                        / indexableFiles.size());
-                updateStatus(
-                        repository,
-                        "IN_PROGRESS",
-                        progress,
-                        0,
-                        0,
-                        "Downloading source files",
-                        null);
-            }
-        }
-
-        if (documents.isEmpty()) {
-            throw new IllegalStateException(
-                    "No indexable source files were found.");
-        }
-
-        int indexedDocuments = 0;
-        int totalDocuments = documents.size();
-        int lastProgress = 45;
-        updateStatus(
-                repository,
-                "IN_PROGRESS",
-                45,
-                0,
-                totalDocuments,
-                "Embedding and storing source chunks",
-                null);
         try {
-            for (int offset = 0; offset < documents.size();
-                    offset += MAX_DOCUMENTS_PER_BATCH) {
-                int batchEnd = Math.min(
-                        offset + MAX_DOCUMENTS_PER_BATCH,
-                        documents.size());
-                List<Document> documentBatch =
-                        documents.subList(offset, batchEnd);
-                int storedDocuments =
-                        addDocumentsWithTokenLimitFallback(documentBatch);
-                indexedDocuments += storedDocuments;
-                totalDocuments += storedDocuments - documentBatch.size();
+            try (var downloadExecutor =
+                         Executors.newVirtualThreadPerTaskExecutor()) {
+                for (int offset = 0; offset < indexableFiles.size();
+                        offset += MAX_CONCURRENT_DOWNLOADS) {
+                    int batchEnd = Math.min(
+                            offset + MAX_CONCURRENT_DOWNLOADS,
+                            indexableFiles.size());
+                    List<CompletableFuture<DownloadedFile>> downloads =
+                            new ArrayList<>(batchEnd - offset);
 
-                int progress = Math.max(lastProgress, 45 + (int) Math.round(
-                        (double) indexedDocuments * 50 / totalDocuments));
-                lastProgress = progress;
-                updateStatus(
-                        repository,
-                        "IN_PROGRESS",
-                        progress,
-                        indexedDocuments,
-                        totalDocuments,
-                        "Embedding and storing source chunks",
-                        null);
+                    for (int fileIndex = offset; fileIndex < batchEnd; fileIndex++) {
+                        String path = indexableFiles.get(fileIndex)
+                                .path("path").asText();
+                        downloads.add(CompletableFuture.supplyAsync(
+                                () -> downloadFile(owner, repo, finalBranch, path),
+                                downloadExecutor));
+                    }
+
+                    for (int fileIndex = offset; fileIndex < batchEnd; fileIndex++) {
+                        DownloadedFile downloaded;
+                        try {
+                            downloaded = downloads.get(fileIndex - offset).join();
+                        } catch (CompletionException exception) {
+                            if (exception.getCause() instanceof RuntimeException cause) {
+                                throw cause;
+                            }
+                            throw exception;
+                        }
+
+                        if (downloaded.content() != null
+                                && !downloaded.content().isBlank()) {
+                            List<String> chunks = chunkContent(downloaded.content());
+                            for (int chunkNumber = 0;
+                                    chunkNumber < chunks.size();
+                                    chunkNumber++) {
+                                documentBatch.add(new Document(
+                                        chunks.get(chunkNumber),
+                                        Map.of(
+                                                "repositoryId", repositoryId,
+                                                "repositoryName", repository.getName(),
+                                                "filePath", downloaded.path(),
+                                                "chunkNumber", chunkNumber,
+                                                "indexVersion", indexVersion
+                                        )
+                                ));
+
+                                if (documentBatch.size()
+                                        >= MAX_DOCUMENTS_PER_BATCH) {
+                                    int progress = embeddingProgress(
+                                            indexedDocuments,
+                                            estimatedTotalChunks);
+                                    if (!embeddingStageStarted
+                                            || progress > lastProgress) {
+                                        lastProgress = Math.max(
+                                                lastProgress, progress);
+                                        updateStatus(
+                                                repository,
+                                                "IN_PROGRESS",
+                                                lastProgress,
+                                                indexedDocuments,
+                                                statusTotalChunks,
+                                                "Creating code embeddings",
+                                                null);
+                                        embeddingStageStarted = true;
+                                    }
+                                    indexedDocuments +=
+                                            addDocumentsWithTokenLimitFallback(
+                                                    documentBatch);
+                                    documentBatch.clear();
+                                    progress = embeddingProgress(
+                                            indexedDocuments,
+                                            estimatedTotalChunks);
+                                    if (progress > lastProgress) {
+                                        lastProgress = progress;
+                                        updateStatus(
+                                                repository,
+                                                "IN_PROGRESS",
+                                                progress,
+                                                indexedDocuments,
+                                                statusTotalChunks,
+                                                "Creating code embeddings",
+                                                null);
+                                    }
+                                }
+
+                                if (!embeddingStageStarted) {
+                                    int downloadProgress = 5 + (int) (
+                                            (long) batchEnd * 5 / indexableFiles.size());
+                                    if (downloadProgress > lastProgress) {
+                                        lastProgress = downloadProgress;
+                                        updateStatus(
+                                                repository,
+                                                "IN_PROGRESS",
+                                                downloadProgress,
+                                                indexedDocuments,
+                                                statusTotalChunks,
+                                                "Downloading source files",
+                                                null);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
+            if (!documentBatch.isEmpty()) {
+                if (!embeddingStageStarted) {
+                    updateStatus(
+                            repository,
+                            "IN_PROGRESS",
+                            lastProgress,
+                            indexedDocuments,
+                            statusTotalChunks,
+                            "Creating code embeddings",
+                            null);
+                }
+                indexedDocuments +=
+                        addDocumentsWithTokenLimitFallback(documentBatch);
+                documentBatch.clear();
+            }
+
+            if (indexedDocuments == 0) {
+                throw new IllegalStateException(
+                        "No indexable source files were found.");
+            }
             updateStatus(
                     repository,
                     "IN_PROGRESS",
                     95,
                     indexedDocuments,
-                    documents.size(),
-                    "Finalizing index",
+                    statusTotalChunks,
+                    "Finishing Q&A optimization",
                     null);
         } catch (RuntimeException exception) {
             try {
@@ -355,8 +385,8 @@ public class RepositoryIndexService {
                 "COMPLETED",
                 100,
                 indexedDocuments,
-                documents.size(),
-                "Indexing complete",
+                indexedDocuments,
+                "Q&A optimization complete",
                 null
         );
 
@@ -433,6 +463,23 @@ public class RepositoryIndexService {
             start = end - CHUNK_OVERLAP_CHARS;
         }
         return chunks;
+    }
+
+    static long estimateChunkCount(long size) {
+        if (size <= MAX_CHUNK_CHARS) {
+            return size > 0 ? 1 : 0;
+        }
+        long chunkStep = MAX_CHUNK_CHARS - CHUNK_OVERLAP_CHARS;
+        return 1 + (size - MAX_CHUNK_CHARS + chunkStep - 1) / chunkStep;
+    }
+
+    private int embeddingProgress(int indexedChunks, long estimatedTotalChunks) {
+        if (estimatedTotalChunks <= 0) {
+            return 5;
+        }
+        return 5 + (int) Math.min(
+                89,
+                (long) indexedChunks * 89 / estimatedTotalChunks);
     }
 
     int addDocumentsWithTokenLimitFallback(List<Document> documents) {

@@ -8,6 +8,9 @@ import com.repoinsight.repository.exception.RepositoryNotFoundException;
 import com.repoinsight.repository.repository.AnalysisReportRepository;
 import com.repoinsight.repository.repository.RepositoryInfoRepository;
 import org.springframework.stereotype.Service;
+import org.springframework.data.domain.Sort;
+
+import java.util.List;
 
 @Service
 public class AnalysisService {
@@ -28,17 +31,34 @@ public class AnalysisService {
         this.analysisFailureService = analysisFailureService;
     }
 
-    public AnalysisReport createPendingReport(Long repositoryId) {
+    public synchronized AnalysisReport createPendingReport(Long repositoryId) {
         RepositoryInfo repository = repositoryInfoRepository
                 .findById(repositoryId)
                 .orElseThrow(
                         () -> new RepositoryNotFoundException(repositoryId));
 
         AnalysisReport report = new AnalysisReport();
+        report.setId(findSmallestAvailableReportId());
         report.setRepositoryInfo(repository);
         report.setStatus(AnalysisStatus.PENDING);
 
         return analysisReportRepository.save(report);
+    }
+
+    private Long findSmallestAvailableReportId() {
+        List<AnalysisReport> reports =
+                analysisReportRepository.findAll(Sort.by("id"));
+        long expectedId = 1;
+
+        for (AnalysisReport report : reports) {
+            long currentId = report.getId();
+            if (currentId == expectedId) {
+                expectedId++;
+            } else if (currentId > expectedId) {
+                break;
+            }
+        }
+        return expectedId;
     }
 
     public AnalysisReport analyzeRepository(Long repositoryId) {

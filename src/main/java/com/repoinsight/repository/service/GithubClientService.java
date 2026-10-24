@@ -200,7 +200,7 @@ public class GithubClientService {
             fileCount++;
 
             // Keep a bounded sample so reports don't become enormous.
-            if (sampleFilePaths.size() < 30) {
+            if (sampleFilePaths.size() < 8) {
                 sampleFilePaths.add(path);
             }
 

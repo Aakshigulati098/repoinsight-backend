@@ -4,6 +4,7 @@ import com.repoinsight.repository.entity.AnalysisReport;
 import com.repoinsight.repository.kafka.AnalysisRequestProducer;
 import com.repoinsight.repository.repository.AnalysisReportRepository;
 import com.repoinsight.repository.service.AnalysisService;
+import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
@@ -55,7 +56,8 @@ public class AnalysisController {
 
     @GetMapping
     public List<AnalysisReport> getAllReports() {
-        return analysisReportRepository.findAll();
+        return analysisReportRepository.findAll(
+                Sort.by(Sort.Direction.DESC, "createdAt"));
     }
 
     @GetMapping("/{reportId}")

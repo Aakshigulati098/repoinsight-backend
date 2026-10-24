@@ -8,7 +8,6 @@ import java.time.LocalDateTime;
 public class AnalysisReport {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
     @ManyToOne(fetch = FetchType.LAZY)
@@ -53,6 +52,10 @@ public class AnalysisReport {
 
     public Long getId() {
         return id;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
     }
 
     public RepositoryInfo getRepositoryInfo() {

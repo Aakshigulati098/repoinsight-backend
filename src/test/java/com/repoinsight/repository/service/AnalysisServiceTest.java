@@ -10,6 +10,7 @@ import com.repoinsight.repository.repository.RepositoryInfoRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.data.domain.Sort;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -65,6 +66,27 @@ class AnalysisServiceTest {
         assertThatThrownBy(() -> service.analyzeRepository(15L))
                 .isInstanceOf(RepositoryNotFoundException.class)
                 .hasMessageContaining("15");
+    }
+
+    @Test
+    void createPendingReportReusesLowestMissingId() {
+        RepositoryInfo repository = repository();
+        AnalysisReport firstReport = new AnalysisReport();
+        firstReport.setId(1L);
+        AnalysisReport thirdReport = new AnalysisReport();
+        thirdReport.setId(3L);
+
+        when(repositoryInfoRepository.findById(7L))
+                .thenReturn(Optional.of(repository));
+        when(analysisReportRepository.findAll(Sort.by("id")))
+                .thenReturn(List.of(firstReport, thirdReport));
+        when(analysisReportRepository.save(any(AnalysisReport.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+
+        AnalysisReport report = service.createPendingReport(7L);
+
+        assertThat(report.getId()).isEqualTo(2L);
+        assertThat(report.getStatus()).isEqualTo(AnalysisStatus.PENDING);
     }
 
     @Test
