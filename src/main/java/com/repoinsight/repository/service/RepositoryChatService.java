@@ -21,6 +21,9 @@ import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.Executors;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
@@ -28,10 +31,11 @@ import org.springframework.ai.vectorstore.VectorStore;
 @Service
 public class RepositoryChatService {
 
-    private static final int MAX_FILES = 14;
-    private static final int MAX_SEED_FILES = 8;
-    private static final int MAX_FILE_CHARS = 6000;
-    private static final int MAX_CONTEXT_CHARS = 16000;
+    private static final int MAX_FILES = 6;
+    private static final int MAX_SEED_FILES = 4;
+    private static final int MAX_CONCURRENT_SOURCE_FETCHES = 6;
+    private static final int MAX_FILE_CHARS = 4000;
+    private static final int MAX_CONTEXT_CHARS = 6000;
     private static final Pattern JAVA_IMPORT = Pattern.compile(
             "(?m)^\\s*import\\s+(?:static\\s+)?([\\w.]+)(\\.\\*)?\\s*;");
     private static final Pattern PACKAGE_DECLARATION = Pattern.compile(
@@ -71,6 +75,7 @@ public class RepositoryChatService {
     }
 
     public Map<String, Object> ask(Long repositoryId, String question) {
+        long requestStartedNanos = System.nanoTime();
         if (question == null || question.isBlank()) {
             throw new IllegalArgumentException("Question is required");
         }
@@ -79,12 +84,17 @@ public class RepositoryChatService {
                 .orElseThrow(() -> new IllegalArgumentException(
                         "Repository not found: " + repositoryId));
 
+        long retrievalStartedNanos = System.nanoTime();
         Map<String, Object> ragAnswer =
                 answerUsingRag(repository, repositoryId, question);
 
         if (ragAnswer != null) {
+            log.info("Repository chat completed: repositoryId={}, route=rag, elapsedMs={}",
+                    repositoryId, elapsedMillis(requestStartedNanos));
             return ragAnswer;
         }
+        log.info("Repository chat RAG retrieval missed: repositoryId={}, retrievalMs={}",
+                repositoryId, elapsedMillis(retrievalStartedNanos));
 
         String[] parts = parseGitHubUrl(repository.getGithubUrl());
         String owner = parts[0];
@@ -103,6 +113,7 @@ public class RepositoryChatService {
         if (tree == null || !tree.has("tree")) {
             throw new IllegalStateException("Could not fetch the repository file tree");
         }
+        long treeFetchMillis = elapsedMillis(retrievalStartedNanos);
 
         List<String> candidates = new ArrayList<>();
         for (JsonNode item : tree.path("tree")) {
@@ -153,54 +164,74 @@ public class RepositoryChatService {
         }
 
         int contextChars = 0;
-        while (!pending.isEmpty() && sources.size() < MAX_FILES
-                && contextChars < MAX_CONTEXT_CHARS) {
-            String path = pending.removeFirst();
-            String content = fetchSource(owner, repo, selectedBranch, path);
-            if (content == null || content.isBlank()) {
-                continue;
-            }
-
-            if (content.length() > MAX_FILE_CHARS) {
-                content = content.substring(0, MAX_FILE_CHARS);
-            }
-            int remaining = MAX_CONTEXT_CHARS - contextChars;
-            if (remaining <= 0) {
-                break;
-            }
-            if (content.length() > remaining) {
-                content = content.substring(0, remaining);
-            }
-            sources.put(path, content);
-            contextChars += content.length();
-
-            // Follow explicit Java imports to pull in services, repositories,
-            // DTOs, entities, and other project classes related to the seed files.
-            if (path.endsWith(".java")) {
-                // Resolve explicit imports first.
-                for (String importedClass : importedSimpleNames(content)) {
-                    enqueueClassPaths(importedClass, pathsByClassName, queued, pending);
+        try (var sourceExecutor = Executors.newVirtualThreadPerTaskExecutor()) {
+            while (!pending.isEmpty() && sources.size() < MAX_FILES
+                    && contextChars < MAX_CONTEXT_CHARS) {
+                List<String> batchPaths = new ArrayList<>();
+                int batchLimit = Math.min(
+                        MAX_FILES - sources.size(),
+                        MAX_CONCURRENT_SOURCE_FETCHES);
+                while (!pending.isEmpty() && batchPaths.size() < batchLimit) {
+                    batchPaths.add(pending.removeFirst());
                 }
 
-                // Java permits references to types in the same package without imports.
-                // This is crucial for repositories such as Spring PetClinic, where a
-                // controller and its repository may share a package. Follow types named
-                // in constructor parameters instead of filling the file budget with
-                // unrelated controllers or entities.
-                for (String parameterType : constructorParameterTypeNames(content)) {
-                    enqueueClassPaths(parameterType, pathsByClassName, queued, pending);
-                }
+                List<CompletableFuture<String>> downloads = batchPaths.stream()
+                        .map(path -> CompletableFuture.supplyAsync(
+                                () -> fetchSource(
+                                        owner, repo, selectedBranch, path),
+                                sourceExecutor))
+                        .toList();
 
-                // Resolve wildcard package imports against Java source paths.
-                for (String packageName : importedWildcardPackages(content)) {
-                    for (String candidate : candidates) {
-                        if (queued.size() >= MAX_FILES) {
-                            break;
+                for (int batchIndex = 0; batchIndex < batchPaths.size(); batchIndex++) {
+                    String path;
+                    String content;
+                    try {
+                        path = batchPaths.get(batchIndex);
+                        content = downloads.get(batchIndex).join();
+                    } catch (CompletionException exception) {
+                        if (exception.getCause() instanceof RuntimeException cause) {
+                            throw cause;
                         }
-                        if (candidate.endsWith(".java")
-                                && belongsToPackage(candidate, packageName)
-                                && queued.add(candidate)) {
-                            pending.addLast(candidate);
+                        throw exception;
+                    }
+
+                    if (content == null || content.isBlank()) {
+                        continue;
+                    }
+
+                    if (content.length() > MAX_FILE_CHARS) {
+                        content = content.substring(0, MAX_FILE_CHARS);
+                    }
+                    int remaining = MAX_CONTEXT_CHARS - contextChars;
+                    if (remaining <= 0) {
+                        break;
+                    }
+                    if (content.length() > remaining) {
+                        content = content.substring(0, remaining);
+                    }
+                    sources.put(path, content);
+                    contextChars += content.length();
+
+                    if (path.endsWith(".java")) {
+                        for (String importedClass : importedSimpleNames(content)) {
+                            enqueueClassPaths(
+                                    importedClass, pathsByClassName, queued, pending);
+                        }
+                        for (String parameterType : constructorParameterTypeNames(content)) {
+                            enqueueClassPaths(
+                                    parameterType, pathsByClassName, queued, pending);
+                        }
+                        for (String packageName : importedWildcardPackages(content)) {
+                            for (String candidate : candidates) {
+                                if (queued.size() >= MAX_FILES) {
+                                    break;
+                                }
+                                if (candidate.endsWith(".java")
+                                        && belongsToPackage(candidate, packageName)
+                                        && queued.add(candidate)) {
+                                    pending.addLast(candidate);
+                                }
+                            }
                         }
                     }
                 }
@@ -210,6 +241,7 @@ public class RepositoryChatService {
         if (sources.isEmpty()) {
             throw new IllegalStateException("Could not retrieve source files from GitHub");
         }
+        long sourceFetchMillis = elapsedMillis(retrievalStartedNanos) - treeFetchMillis;
 
         // Include explicit line numbers so the model can cite verifiable locations.
         StringBuilder context = new StringBuilder();
@@ -217,8 +249,13 @@ public class RepositoryChatService {
                 .append("\n\n--- FILE: ").append(path).append(" ---\n")
                 .append(formatSourceWithLineNumbers(content)));
 
-        String evidenceIndex = buildEvidenceIndex(sources);
-        String dependencyGraph = buildDependencyGraph(sources);
+        boolean dependencyQuestion = isDependencyQuestion(question);
+        String evidenceIndex = dependencyQuestion
+                ? buildEvidenceIndex(sources)
+                : "Not needed for this question.";
+        String dependencyGraph = dependencyQuestion
+                ? buildDependencyGraph(sources)
+                : "Not needed for this question.";
 
         String systemPrompt = """
                 You are RepoInsight, a source-grounded code analysis assistant.
@@ -247,6 +284,9 @@ public class RepositoryChatService {
                 Keep findings specific to the exact declared class and cited lines. Do not
                 use a general framework convention as evidence that an annotation exists.
                 If unsure, explicitly state that the source does not establish the claim.
+                Answer in clear, concise paragraphs or numbered steps, matching the
+                question. Do not output source code or fenced code blocks unless the user
+                explicitly asks for code. Do not describe your drafting or revision process.
                 """;
 
         String userPrompt = """
@@ -268,36 +308,18 @@ public class RepositoryChatService {
                 """.formatted(repository.getName(), repository.getGithubUrl(),
                 dependencyGraph, context, evidenceIndex, question);
 
+        long generationStartedNanos = System.nanoTime();
         String answer = chatClient.prompt()
                 .system(systemPrompt)
                 .user(userPrompt)
                 .call()
                 .content();
+        long generationMillis = elapsedMillis(generationStartedNanos);
 
         List<String> validationErrors = validateAnswer(answer, sources);
         if (!validationErrors.isEmpty()) {
-            // One constrained repair pass; never return an answer with invalid citations.
-            answer = chatClient.prompt()
-                    .system(systemPrompt + """
-
-                            VALIDATION IS STRICT: every repository-specific paragraph/bullet
-                            needs a citation to a supplied file and valid line range. Any
-                            annotation you mention positively must exist in that cited file.
-                            Keep citations close to the claims they support. Do not add
-                            unsupported details to fill gaps.
-                            """)
-                    .user(userPrompt + """
-
-                            Your previous answer failed deterministic validation:
-                            %s
-
-                            Rewrite the answer from scratch. Remove any claim that cannot be
-                            supported by exact cited lines. Do not discuss this validation.
-                            """.formatted(String.join("\n- ", validationErrors)))
-                    .call()
-                    .content();
-
-            validationErrors = validateAnswer(answer, sources);
+            log.warn("Repository chat answer citation validation found issues: repositoryId={}, issues={}",
+                    repositoryId, validationErrors.size());
         }
 
         if (!validationErrors.isEmpty()) {
@@ -310,11 +332,27 @@ public class RepositoryChatService {
             }
         }
 
+        log.info("Repository chat completed: repositoryId={}, route=github-fallback, files={}, contextChars={}, treeFetchMs={}, sourceFetchMs={}, generationMs={}, elapsedMs={}",
+                repositoryId, sources.size(), context.length(), treeFetchMillis,
+                sourceFetchMillis, generationMillis, elapsedMillis(requestStartedNanos));
+
         return Map.of(
                 "repositoryId", repositoryId,
                 "answer", answer == null ? "" : answer,
                 "sources", sources.keySet()
         );
+    }
+
+    private long elapsedMillis(long startedNanos) {
+        return (System.nanoTime() - startedNanos) / 1_000_000;
+    }
+
+    private boolean isDependencyQuestion(String question) {
+        String lower = question.toLowerCase(Locale.ROOT);
+        return lower.contains("dependency") || lower.contains("inject")
+                || lower.contains("bean") || lower.contains("autowired")
+                || lower.contains("wiring") || lower.contains("spring")
+                || lower.contains("annotation");
     }
 
     /**
@@ -817,14 +855,29 @@ public class RepositoryChatService {
             String question) {
 
         // Retrieve a wider candidate set, then rerank it before sending to the LLM.
+        long retrievalStartedNanos = System.nanoTime();
         List<Document> matches = vectorStore.similaritySearch(
                 SearchRequest.builder()
                         .query(question)
-                        .topK(20)
+                        .topK(12)
                         .filterExpression("repositoryId == " + repositoryId)
                         .build());
 
         if (matches == null || matches.isEmpty()) {
+            log.info("Repository chat vector retrieval returned no matches: repositoryId={}, elapsedMs={}",
+                    repositoryId, elapsedMillis(retrievalStartedNanos));
+            return null;
+        }
+        boolean quickIndex = matches.stream().anyMatch(document ->
+                "quick".equals(document.getMetadata().get("indexScope")));
+        int bestKeywordScore = matches.stream()
+                .mapToInt(document -> scoreChunk(document, question))
+                .max()
+                .orElse(0);
+        if (quickIndex && bestKeywordScore < 8) {
+            log.info("Repository chat quick-index relevance was low: repositoryId={}, bestScore={}, elapsedMs={}",
+                    repositoryId, bestKeywordScore,
+                    elapsedMillis(retrievalStartedNanos));
             return null;
         }
 
@@ -837,7 +890,7 @@ public class RepositoryChatService {
 
         // Keep the final context small and relevant.
         List<Document> selected = rankedMatches.stream()
-                .limit(6)
+                .limit(4)
                 .toList();
 
         StringBuilder context = new StringBuilder();
@@ -863,6 +916,9 @@ public class RepositoryChatService {
 
             Answer repository-specific questions using only the retrieved code.
             Never invent classes, methods, endpoints, annotations, or behavior.
+            Write a direct, readable answer in concise paragraphs or numbered
+            steps that match the question. Do not output code blocks unless the
+            user explicitly asks for code. Do not mention drafting or revision.
 
             RETRIEVAL RULES:
             - Retrieved chunks are candidates, not automatically correct evidence.
@@ -880,10 +936,14 @@ public class RepositoryChatService {
               Spring Boot applications.
 
             ANSWER FORMAT:
-            - Answer the question directly.
+            - Answer directly in concise, readable paragraphs or numbered steps,
+              matching the question.
+            - Do not output source code or fenced code blocks unless explicitly asked.
+            - Do not describe your drafting or revision process.
             - Name the relevant source file for each important claim.
             - Explain what the retrieved code actually demonstrates.
             - Explicitly mention uncertainty when the evidence is incomplete.
+            - Use source file paths in the prose when they support an important claim.
             """;
 
         String userPrompt = """
@@ -901,11 +961,16 @@ public class RepositoryChatService {
                 context,
                 question);
 
+        long generationStartedNanos = System.nanoTime();
         String answer = chatClient.prompt()
                 .system(systemPrompt)
                 .user(userPrompt)
                 .call()
                 .content();
+        log.info("Repository chat RAG answered: repositoryId={}, matches={}, contextChars={}, retrievalMs={}, generationMs={}",
+                repositoryId, selected.size(), context.length(),
+                elapsedMillis(retrievalStartedNanos),
+                elapsedMillis(generationStartedNanos));
 
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("repositoryId", repositoryId);

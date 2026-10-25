@@ -10,13 +10,19 @@ import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.web.client.RestClient;
 
 import java.net.URI;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -28,9 +34,11 @@ import java.util.concurrent.Executors;
 @Service
 public class RepositoryIndexService {
 
-    private static final int MAX_CHUNK_CHARS = 900;
+    private static final Logger log = LoggerFactory.getLogger(RepositoryIndexService.class);
+    private static final int MAX_CHUNK_CHARS = 300;
     private static final int CHUNK_OVERLAP_CHARS = 50;
-    private static final int MAX_DOCUMENTS_PER_BATCH = 128;
+    private static final int MAX_QUICK_INDEX_CHUNKS = 24;
+    private static final int MAX_DOCUMENTS_PER_BATCH = 8;
     private static final int MAX_CONCURRENT_DOWNLOADS = 8;
     private static final Set<String> EXCLUDED_PATH_SEGMENTS = Set.of(
             ".git",
@@ -70,7 +78,13 @@ public class RepositoryIndexService {
                 .baseUrl("https://api.github.com")
                 .defaultHeader("Accept", "application/vnd.github+json")
                 .build();
-        this.rawContentClient = RestClient.create();
+        SimpleClientHttpRequestFactory rawContentRequestFactory =
+                new SimpleClientHttpRequestFactory();
+        rawContentRequestFactory.setConnectTimeout(Duration.ofSeconds(10));
+        rawContentRequestFactory.setReadTimeout(Duration.ofSeconds(30));
+        this.rawContentClient = RestClient.builder()
+                .requestFactory(rawContentRequestFactory)
+                .build();
     }
 
     public Long findSmallestAvailableId() {
@@ -155,6 +169,7 @@ public class RepositoryIndexService {
     }
 
     public int indexRepository(Long repositoryId) {
+        long indexingStartedNanos = System.nanoTime();
         RepositoryInfo repository = repositoryInfoRepository
                 .findById(repositoryId)
                 .orElseThrow(() ->
@@ -208,16 +223,35 @@ public class RepositoryIndexService {
                     "No indexable source files were found.");
         }
 
-        long estimatedTotalChunks = indexableFiles.stream()
-                .mapToLong(item -> estimateChunkCount(
-                        item.path("size").asLong(0)))
-                .sum();
+        List<SelectedIndexFile> selectedFiles =
+                selectQuickIndexFiles(indexableFiles, MAX_QUICK_INDEX_CHUNKS);
+        Map<String, ExistingFileIndex> existingFiles = loadExistingFileIndex(repositoryId);
+        List<SelectedIndexFile> changedFiles = new ArrayList<>();
+        Map<String, String> reusableFiles = new HashMap<>();
+        long estimatedTotalChunks = 0;
+        long reusableChunkCount = 0;
+        for (SelectedIndexFile selectedFile : selectedFiles) {
+            JsonNode item = selectedFile.file();
+            String path = item.path("path").asText();
+            String blobSha = item.path("sha").asText("");
+            ExistingFileIndex existing = existingFiles.get(path);
+            if (!blobSha.isBlank() && existing != null
+                    && blobSha.equals(existing.blobSha())
+                    && selectedFile.chunkLimit() == existing.chunkCount()) {
+                reusableFiles.put(path, blobSha);
+                reusableChunkCount += existing.chunkCount();
+            } else {
+                changedFiles.add(selectedFile);
+                estimatedTotalChunks += selectedFile.chunkLimit();
+            }
+        }
         int statusTotalChunks = (int) Math.min(
-                estimatedTotalChunks, Integer.MAX_VALUE);
+                estimatedTotalChunks + reusableChunkCount, Integer.MAX_VALUE);
         String indexVersion = UUID.randomUUID().toString();
         int indexedDocuments = 0;
         int lastProgress = 5;
         boolean embeddingStageStarted = false;
+        int downloadedFiles = 0;
         List<Document> documentBatch =
                 new ArrayList<>(MAX_DOCUMENTS_PER_BATCH);
         updateStatus(
@@ -226,21 +260,23 @@ public class RepositoryIndexService {
                 5,
                 0,
                 statusTotalChunks,
-                "Downloading source files",
+                changedFiles.isEmpty()
+                        ? "Reusing unchanged quick Q&A index"
+                        : "Downloading source files (0/" + changedFiles.size() + ")",
                 null);
         try {
             try (var downloadExecutor =
                          Executors.newVirtualThreadPerTaskExecutor()) {
-                for (int offset = 0; offset < indexableFiles.size();
+                for (int offset = 0; offset < changedFiles.size();
                         offset += MAX_CONCURRENT_DOWNLOADS) {
                     int batchEnd = Math.min(
                             offset + MAX_CONCURRENT_DOWNLOADS,
-                            indexableFiles.size());
+                            changedFiles.size());
                     List<CompletableFuture<DownloadedFile>> downloads =
                             new ArrayList<>(batchEnd - offset);
 
                     for (int fileIndex = offset; fileIndex < batchEnd; fileIndex++) {
-                        String path = indexableFiles.get(fileIndex)
+                        String path = changedFiles.get(fileIndex).file()
                                 .path("path").asText();
                         downloads.add(CompletableFuture.supplyAsync(
                                 () -> downloadFile(owner, repo, finalBranch, path),
@@ -257,12 +293,29 @@ public class RepositoryIndexService {
                             }
                             throw exception;
                         }
+                        downloadedFiles++;
+                        if (!embeddingStageStarted) {
+                            int downloadProgress = 5 + (int) (
+                                    (long) downloadedFiles * 5
+                                            / Math.max(1, changedFiles.size()));
+                            lastProgress = Math.max(lastProgress, downloadProgress);
+                            updateStatus(
+                                    repository,
+                                    "IN_PROGRESS",
+                                    lastProgress,
+                                    indexedDocuments,
+                                    statusTotalChunks,
+                                    "Downloading source files (" + downloadedFiles
+                                            + "/" + changedFiles.size() + ")",
+                                    null);
+                        }
 
                         if (downloaded.content() != null
                                 && !downloaded.content().isBlank()) {
                             List<String> chunks = chunkContent(downloaded.content());
+                            int chunkLimit = changedFiles.get(fileIndex).chunkLimit();
                             for (int chunkNumber = 0;
-                                    chunkNumber < chunks.size();
+                                    chunkNumber < Math.min(chunks.size(), chunkLimit);
                                     chunkNumber++) {
                                 documentBatch.add(new Document(
                                         chunks.get(chunkNumber),
@@ -270,7 +323,10 @@ public class RepositoryIndexService {
                                                 "repositoryId", repositoryId,
                                                 "repositoryName", repository.getName(),
                                                 "filePath", downloaded.path(),
+                                                "blobSha", changedFiles.get(fileIndex)
+                                                        .file().path("sha").asText(""),
                                                 "chunkNumber", chunkNumber,
+                                                "indexScope", "quick",
                                                 "indexVersion", indexVersion
                                         )
                                 ));
@@ -290,7 +346,7 @@ public class RepositoryIndexService {
                                                 lastProgress,
                                                 indexedDocuments,
                                                 statusTotalChunks,
-                                                "Creating code embeddings",
+                                                "Creating quick Q&A embeddings",
                                                 null);
                                         embeddingStageStarted = true;
                                     }
@@ -309,26 +365,11 @@ public class RepositoryIndexService {
                                                 progress,
                                                 indexedDocuments,
                                                 statusTotalChunks,
-                                                "Creating code embeddings",
+                                                "Creating quick Q&A embeddings",
                                                 null);
                                     }
                                 }
 
-                                if (!embeddingStageStarted) {
-                                    int downloadProgress = 5 + (int) (
-                                            (long) batchEnd * 5 / indexableFiles.size());
-                                    if (downloadProgress > lastProgress) {
-                                        lastProgress = downloadProgress;
-                                        updateStatus(
-                                                repository,
-                                                "IN_PROGRESS",
-                                                downloadProgress,
-                                                indexedDocuments,
-                                                statusTotalChunks,
-                                                "Downloading source files",
-                                                null);
-                                    }
-                                }
                             }
                         }
                     }
@@ -343,7 +384,7 @@ public class RepositoryIndexService {
                             lastProgress,
                             indexedDocuments,
                             statusTotalChunks,
-                            "Creating code embeddings",
+                            "Creating quick Q&A embeddings",
                             null);
                 }
                 indexedDocuments +=
@@ -351,17 +392,24 @@ public class RepositoryIndexService {
                 documentBatch.clear();
             }
 
-            if (indexedDocuments == 0) {
+            if (indexedDocuments + reusableChunkCount == 0) {
                 throw new IllegalStateException(
                         "No indexable source files were found.");
             }
+            // Only switch unchanged files to the new version after all changed files
+            // have embedded successfully. If indexing fails, the old version remains usable.
+            if (!reusableFiles.isEmpty()) {
+                updateReusableFileMetadata(
+                        repositoryId, indexVersion, reusableFiles);
+            }
+            indexedDocuments += (int) Math.min(reusableChunkCount, Integer.MAX_VALUE - indexedDocuments);
             updateStatus(
                     repository,
                     "IN_PROGRESS",
                     95,
                     indexedDocuments,
                     statusTotalChunks,
-                    "Finishing Q&A optimization",
+                    "Cleaning up outdated index entries",
                     null);
         } catch (RuntimeException exception) {
             try {
@@ -372,6 +420,7 @@ public class RepositoryIndexService {
             throw exception;
         }
 
+        long cleanupStartedNanos = System.nanoTime();
         jdbcTemplate.update(
                 "DELETE FROM vector_store " +
                         "WHERE metadata->>'repositoryId' = ? " +
@@ -386,11 +435,155 @@ public class RepositoryIndexService {
                 100,
                 indexedDocuments,
                 indexedDocuments,
-                "Q&A optimization complete",
+                "Quick Q&A preparation complete",
                 null
         );
+        long elapsedMillis = (System.nanoTime() - indexingStartedNanos) / 1_000_000;
+        long cleanupMillis = (System.nanoTime() - cleanupStartedNanos) / 1_000_000;
+        log.info("Quick repository indexing completed: repositoryId={}, eligibleFiles={}, selectedFiles={}, reusedFiles={}, chunks={}, cleanupMs={}, elapsedMs={}",
+                repositoryId, indexableFiles.size(), selectedFiles.size(),
+                reusableFiles.size(), indexedDocuments, cleanupMillis, elapsedMillis);
 
         return indexedDocuments;
+    }
+
+    private void updateReusableFileMetadata(
+            Long repositoryId,
+            String indexVersion,
+            Map<String, String> reusableFiles) {
+        String valuesClause = String.join(
+                ", ", java.util.Collections.nCopies(reusableFiles.size(), "(?, ?)"));
+        String sql = "UPDATE vector_store AS indexed " +
+                "SET metadata = (jsonb_set(jsonb_set(indexed.metadata::jsonb, " +
+                "'{indexVersion}', to_jsonb(CAST(? AS text)), true), " +
+                "'{indexScope}', '\"quick\"'::jsonb, true))::json " +
+                "FROM (VALUES " + valuesClause + ") AS reusable(file_path, blob_sha) " +
+                "WHERE indexed.metadata->>'repositoryId' = ? " +
+                "AND indexed.metadata->>'filePath' = reusable.file_path " +
+                "AND indexed.metadata->>'blobSha' = reusable.blob_sha";
+        List<Object> parameters = new ArrayList<>();
+        parameters.add(indexVersion);
+        reusableFiles.forEach((path, blobSha) -> {
+            parameters.add(path);
+            parameters.add(blobSha);
+        });
+        parameters.add(repositoryId.toString());
+        jdbcTemplate.update(sql, parameters.toArray());
+    }
+
+    private Map<String, ExistingFileIndex> loadExistingFileIndex(Long repositoryId) {
+        List<ExistingFileIndex> rows = jdbcTemplate.query(
+                "SELECT metadata->>'filePath' AS file_path, metadata->>'blobSha' AS blob_sha, COUNT(*) AS chunk_count " +
+                        "FROM vector_store WHERE metadata->>'repositoryId' = ? AND metadata->>'blobSha' IS NOT NULL " +
+                        "GROUP BY metadata->>'filePath', metadata->>'blobSha'",
+                (rs, rowNum) -> new ExistingFileIndex(
+                        rs.getString("file_path"),
+                        rs.getString("blob_sha"),
+                        rs.getInt("chunk_count")),
+                repositoryId.toString());
+        Map<String, ExistingFileIndex> indexed = new HashMap<>();
+        for (ExistingFileIndex row : rows) {
+            ExistingFileIndex previous = indexed.get(row.path());
+            if (previous == null || row.chunkCount() > previous.chunkCount()) {
+                indexed.put(row.path(), row);
+            }
+        }
+        return indexed;
+    }
+
+    private record ExistingFileIndex(String path, String blobSha, int chunkCount) {
+    }
+
+    static List<SelectedIndexFile> selectQuickIndexFiles(
+            List<JsonNode> files,
+            int maxChunks) {
+        if (maxChunks <= 0 || files.isEmpty()) {
+            return List.of();
+        }
+
+        List<JsonNode> prioritizedFiles = new ArrayList<>(files);
+        prioritizedFiles.sort(
+                Comparator.comparingInt((JsonNode file) ->
+                                quickIndexPriority(file.path("path").asText()))
+                        .thenComparing(file -> file.path("path").asText()));
+
+        Map<String, Integer> selectedChunkLimits = new LinkedHashMap<>();
+        int selectedChunks = 0;
+        for (JsonNode file : prioritizedFiles) {
+            if (selectedChunks >= maxChunks) {
+                break;
+            }
+            if (estimateChunkCount(file.path("size").asLong(0)) > 0) {
+                selectedChunkLimits.put(file.path("path").asText(), 1);
+                selectedChunks++;
+            }
+        }
+
+        while (selectedChunks < maxChunks) {
+            boolean addedChunk = false;
+            for (JsonNode file : prioritizedFiles) {
+                if (selectedChunks >= maxChunks) {
+                    break;
+                }
+                String path = file.path("path").asText();
+                int selectedForFile = selectedChunkLimits.getOrDefault(path, 0);
+                long availableChunks = estimateChunkCount(
+                        file.path("size").asLong(0));
+                if (selectedForFile < availableChunks) {
+                    selectedChunkLimits.put(path, selectedForFile + 1);
+                    selectedChunks++;
+                    addedChunk = true;
+                }
+            }
+            if (!addedChunk) {
+                break;
+            }
+        }
+
+        List<SelectedIndexFile> selectedFiles = new ArrayList<>();
+        for (JsonNode file : prioritizedFiles) {
+            String path = file.path("path").asText();
+            Integer chunkLimit = selectedChunkLimits.get(path);
+            if (chunkLimit != null) {
+                selectedFiles.add(new SelectedIndexFile(file, chunkLimit));
+            }
+        }
+        return selectedFiles;
+    }
+
+    private static int quickIndexPriority(String path) {
+        String lowerPath = path.toLowerCase();
+        String fileName = lowerPath.substring(lowerPath.lastIndexOf('/') + 1);
+        if (fileName.startsWith("readme")) {
+            return 0;
+        }
+        if (Set.of("pom.xml", "build.gradle", "build.gradle.kts",
+                "package.json", "pyproject.toml", "go.mod",
+                "cargo.toml", "settings.gradle", "settings.gradle.kts")
+                .contains(fileName)) {
+            return 1;
+        }
+        if (Set.of("application.java", "main.java", "app.java",
+                "index.js", "index.ts", "main.py", "main.go")
+                .contains(fileName)) {
+            return 2;
+        }
+        if (lowerPath.contains("/src/main/") || lowerPath.startsWith("src/main/")) {
+            return 3;
+        }
+        if (lowerPath.contains("/src/") || lowerPath.startsWith("src/")) {
+            return 4;
+        }
+        if (lowerPath.contains("config")) {
+            return 5;
+        }
+        if (lowerPath.startsWith("docs/") || lowerPath.contains("/docs/")) {
+            return 6;
+        }
+        return 7;
+    }
+
+    record SelectedIndexFile(JsonNode file, int chunkLimit) {
     }
 
     private DownloadedFile downloadFile(

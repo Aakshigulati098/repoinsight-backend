@@ -3,6 +3,7 @@ package com.repoinsight.repository.service;
 import com.repoinsight.repository.entity.RepositoryInfo;
 import com.repoinsight.repository.repository.RepositoryInfoRepository;
 import org.junit.jupiter.api.Test;
+import tools.jackson.databind.JsonNode;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -29,12 +30,12 @@ class RepositoryIndexServiceTest {
 
         var chunks = RepositoryIndexService.chunkContent(content);
 
-        assertThat(chunks).hasSize(3);
-        assertThat(chunks.get(0)).hasSize(900);
-        assertThat(chunks.get(1)).hasSize(900);
-        assertThat(chunks.get(2)).hasSize(300);
-        assertThat(chunks).allSatisfy(chunk -> assertThat(chunk.length()).isLessThanOrEqualTo(900));
-        assertThat(chunks.get(0).substring(850))
+        assertThat(chunks).hasSize(8);
+        assertThat(chunks.get(0)).hasSize(300);
+        assertThat(chunks.get(1)).hasSize(300);
+        assertThat(chunks.get(7)).hasSize(250);
+        assertThat(chunks).allSatisfy(chunk -> assertThat(chunk.length()).isLessThanOrEqualTo(300));
+        assertThat(chunks.get(0).substring(250))
                 .isEqualTo(chunks.get(1).substring(0, 50));
     }
 
@@ -44,7 +45,7 @@ class RepositoryIndexServiceTest {
         List<Document> storedDocuments = new ArrayList<>();
         doAnswer(invocation -> {
             List<Document> batch = invocation.getArgument(0);
-            if (batch.stream().anyMatch(document -> document.getText().length() > 200)) {
+            if (batch.stream().anyMatch(document -> document.getText().length() > 250)) {
                 throw new IllegalStateException(
                         "input (570 tokens) is too large to process");
             }
@@ -63,7 +64,7 @@ class RepositoryIndexServiceTest {
         assertThat(storedDocuments).hasSize(2);
         assertThat(storedDocuments)
                 .allSatisfy(document -> assertThat(document.getText().length())
-                        .isLessThanOrEqualTo(200));
+                        .isLessThanOrEqualTo(250));
         assertThat(storedDocuments)
                 .allSatisfy(document -> assertThat(document.getMetadata())
                         .containsKey("subChunkNumber"));
@@ -85,6 +86,17 @@ class RepositoryIndexServiceTest {
                 .hasMessage("database unavailable");
     }
 
+    private JsonNode fileNode(String path, long size) {
+        JsonNode file = mock(JsonNode.class);
+        JsonNode pathNode = mock(JsonNode.class);
+        JsonNode sizeNode = mock(JsonNode.class);
+        when(file.path("path")).thenReturn(pathNode);
+        when(pathNode.asText()).thenReturn(path);
+        when(file.path("size")).thenReturn(sizeNode);
+        when(sizeNode.asLong(0)).thenReturn(size);
+        return file;
+    }
+
     @Test
     void chunkContentReturnsNoChunksForBlankContent() {
         assertThat(RepositoryIndexService.chunkContent(" \n\t")).isEmpty();
@@ -93,10 +105,43 @@ class RepositoryIndexServiceTest {
     @Test
     void estimatedChunkCountAccountsForChunkOverlap() {
         assertThat(RepositoryIndexService.estimateChunkCount(0)).isZero();
-        assertThat(RepositoryIndexService.estimateChunkCount(900)).isEqualTo(1);
-        assertThat(RepositoryIndexService.estimateChunkCount(901)).isEqualTo(2);
-        assertThat(RepositoryIndexService.estimateChunkCount(1750)).isEqualTo(2);
-        assertThat(RepositoryIndexService.estimateChunkCount(1751)).isEqualTo(3);
+        assertThat(RepositoryIndexService.estimateChunkCount(300)).isEqualTo(1);
+        assertThat(RepositoryIndexService.estimateChunkCount(301)).isEqualTo(2);
+        assertThat(RepositoryIndexService.estimateChunkCount(550)).isEqualTo(2);
+        assertThat(RepositoryIndexService.estimateChunkCount(551)).isEqualTo(3);
+    }
+
+    @Test
+    void quickIndexSelectsPrioritizedFilesAndRespectsChunkBudget() {
+        var selected = RepositoryIndexService.selectQuickIndexFiles(
+                List.of(
+                        fileNode("src/main/java/z/Service.java", 5000),
+                        fileNode("src/main/java/Application.java", 1800),
+                        fileNode("pom.xml", 400),
+                        fileNode("README.md", 500),
+                        fileNode("src/main/java/a/Controller.java", 3200)),
+                4);
+
+        assertThat(selected)
+                .extracting(item -> item.file().path("path").asText())
+                .containsExactly(
+                        "README.md",
+                        "pom.xml",
+                        "src/main/java/Application.java",
+                        "src/main/java/a/Controller.java");
+        assertThat(selected).extracting(
+                RepositoryIndexService.SelectedIndexFile::chunkLimit)
+                .containsExactly(1, 1, 1, 1);
+    }
+
+    @Test
+    void quickIndexSpreadsAdditionalChunksAfterSelectingFiles() {
+        var selected = RepositoryIndexService.selectQuickIndexFiles(
+                List.of(fileNode("README.md", 7000)),
+                3);
+
+        assertThat(selected).hasSize(1);
+        assertThat(selected.get(0).chunkLimit()).isEqualTo(3);
     }
 
     @Test
