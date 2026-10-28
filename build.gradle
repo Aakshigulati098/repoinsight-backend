@@ -39,6 +39,7 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-jdbc'
     implementation platform("org.springframework.ai:spring-ai-bom:2.0.0")
     implementation 'org.springframework.ai:spring-ai-starter-model-openai'
+	developmentOnly 'org.springframework.boot:spring-boot-devtools'
 }
 
 tasks.named('test') {
