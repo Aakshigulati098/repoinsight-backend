@@ -140,7 +140,7 @@ class AnalysisServiceTest {
     }
 
     @Test
-    void analyzeRepository_WhenGeminiFails_PersistsFailedReport() {
+    void analyzeRepository_WhenAiModelFails_PersistsGithubEvidenceFallback() {
         RepositoryInfo repository = repository();
         when(repositoryInfoRepository.findById(7L)).thenReturn(Optional.of(repository));
         stubReportPersistence();
@@ -153,8 +153,20 @@ class AnalysisServiceTest {
 
         AnalysisReport result = service.analyzeRepository(7L);
 
-        assertThat(result.getStatus()).isEqualTo(AnalysisStatus.FAILED);
+        assertThat(result.getStatus()).isEqualTo(AnalysisStatus.COMPLETED);
         assertThat(result.getReadmeContent()).isEqualTo("# Demo");
+        assertThat(result.getAiSummary())
+                .contains("AI-generated summary is unavailable")
+                .contains("Demo repository")
+                .contains("**Overall Impression:**")
+                .contains("**Detailed Breakdown:**")
+                .contains("**Evidence Analysis & Key Considerations:**")
+                .contains("**Potential Improvements:**")
+                .doesNotContain("Important files identified")
+                .doesNotContain("pom.xml");
+        assertThat(result.getArchitectureDiagram())
+                .startsWith("flowchart TD")
+                .contains("AI architecture generation unavailable");
     }
 
     private RepositoryInfo repository() {

@@ -25,6 +25,17 @@ import static org.mockito.Mockito.when;
 class RepositoryIndexServiceTest {
 
     @Test
+    void rawGitHubFileUrlEncodesSpacesAndPreservesDirectorySeparators() {
+        assertThat(RepositoryIndexService.rawGitHubFileUrl(
+                "akshitagit",
+                "JAVA",
+                "master",
+                "Bit Manipulation/readme.md"))
+                .isEqualTo(
+                        "https://raw.githubusercontent.com/akshitagit/JAVA/master/Bit%20Manipulation/readme.md");
+    }
+
+    @Test
     void chunkContentUsesModelCompatibleOverlappingChunks() {
         String content = "a".repeat(2000);
 
@@ -145,6 +156,46 @@ class RepositoryIndexServiceTest {
     }
 
     @Test
+    void quickIndexCoversDistinctMajorSourceFoldersBeforeOverSamplingOneFolder() {
+        var selected = RepositoryIndexService.selectQuickIndexFiles(
+                List.of(
+                        fileNode("README.md", 500),
+                        fileNode("java/src/Main.java", 900),
+                        fileNode("java/src/Helper.java", 900),
+                        fileNode("python/src/main.py", 900),
+                        fileNode("node/src/index.ts", 900),
+                        fileNode("examples/demo/App.java", 900),
+                        fileNode("docs/guide.md", 900)),
+                5);
+
+        List<String> selectedPaths = selected.stream()
+                .map(item -> item.file().path("path").asText())
+                .toList();
+        assertThat(selectedPaths)
+                .contains("README.md")
+                .contains("java/src/Main.java")
+                .contains("python/src/main.py")
+                .contains("node/src/index.ts");
+        assertThat(selectedPaths)
+                .doesNotContain("java/src/Helper.java");
+    }
+
+    @Test
+    void isIndexableIncludesExamplesAndSamplesButSkipsTestsAndGeneratedFiles() {
+        RepositoryIndexService service = new RepositoryIndexService(
+                mock(RepositoryInfoRepository.class),
+                mock(VectorStore.class),
+                mock(JdbcTemplate.class));
+
+        assertThat(service.isIndexable("examples/demo/App.java", 100)).isTrue();
+        assertThat(service.isIndexable("samples/node/server.ts", 100)).isTrue();
+        assertThat(service.isIndexable("src/test/java/AppTest.java", 100)).isFalse();
+        assertThat(service.isIndexable("target/generated/App.java", 100)).isFalse();
+        assertThat(service.isIndexable("src/lib.rs", 100)).isTrue();
+        assertThat(service.isIndexable("web/components/App.vue", 100)).isTrue();
+    }
+
+    @Test
     void prepareIndexingClearsPreviousFailureBeforeQueueingRetry() {
         RepositoryInfoRepository repositoryInfoRepository =
                 mock(RepositoryInfoRepository.class);
@@ -206,7 +257,7 @@ class RepositoryIndexServiceTest {
         assertThat(service.isIndexable("src/main/java/App.java", 100)).isTrue();
         assertThat(service.isIndexable("docs/guide.md", 100)).isTrue();
         assertThat(service.isIndexable("src/test/java/AppTest.java", 100)).isFalse();
-        assertThat(service.isIndexable("examples/demo/App.java", 100)).isFalse();
+        assertThat(service.isIndexable("examples/demo/App.java", 100)).isTrue();
         assertThat(service.isIndexable("target/generated/App.java", 100)).isFalse();
         assertThat(service.isIndexable("vendor/library/App.java", 100)).isFalse();
     }

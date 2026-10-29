@@ -15,8 +15,10 @@ import org.springframework.stereotype.Service;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.util.UriUtils;
 
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -35,11 +37,11 @@ import java.util.concurrent.Executors;
 public class RepositoryIndexService {
 
     private static final Logger log = LoggerFactory.getLogger(RepositoryIndexService.class);
-    private static final int MAX_DOCUMENTS_PER_BATCH = 8;
-    private static final int MAX_CONCURRENT_DOWNLOADS = 8;
+    private static final int MAX_DOCUMENTS_PER_BATCH = 24;
+    private static final int MAX_CONCURRENT_DOWNLOADS = 16;
     private static final int MAX_CHUNK_CHARS = 800;
     private static final int CHUNK_OVERLAP_CHARS = 120;
-    private static final int MAX_QUICK_INDEX_CHUNKS = 24;
+    private static final int MAX_QUICK_INDEX_CHUNKS = 48;
 
     private static final Set<String> EXCLUDED_PATH_SEGMENTS = Set.of(
             ".git",
@@ -57,8 +59,6 @@ public class RepositoryIndexService {
             "test",
             "tests",
             "testing",
-            "examples",
-            "samples",
             "benchmark",
             "benchmarks");
 
@@ -426,8 +426,14 @@ public class RepositoryIndexService {
         long elapsedMillis = (System.nanoTime() - indexingStartedNanos) / 1_000_000;
         long cleanupMillis = (System.nanoTime() - cleanupStartedNanos) / 1_000_000;
         log.info(
-                "Quick repository indexing completed: repositoryId={}, eligibleFiles={}, selectedFiles={}, reusedFiles={}, chunks={}, cleanupMs={}, elapsedMs={}",
+                "Quick repository indexing completed: repositoryId={}, eligibleFiles={}, selectedFiles={}, topLevelCoverage={}, reusedFiles={}, chunks={}, cleanupMs={}, elapsedMs={}",
                 repositoryId, indexableFiles.size(), selectedFiles.size(),
+                selectedFiles.stream()
+                        .map(selected -> selected.file().path("path").asText())
+                        .map(path -> path.contains("/") ? path.substring(0, path.indexOf("/")) : "[root]")
+                        .distinct()
+                        .sorted()
+                        .toList(),
                 reusableFiles.size(), indexedDocuments, cleanupMillis, elapsedMillis);
 
         return indexedDocuments;
@@ -495,12 +501,68 @@ public class RepositoryIndexService {
 
         Map<String, Integer> selectedChunkLimits = new LinkedHashMap<>();
         int selectedChunks = 0;
+
+        List<JsonNode> rootFiles = prioritizedFiles.stream()
+                .filter(file -> !file.path("path").asText().contains("/"))
+                .toList();
+        for (JsonNode file : rootFiles) {
+            if (selectedChunks >= maxChunks) {
+                break;
+            }
+            if (quickIndexPriority(file.path("path").asText()) <= 1
+                    && estimateChunkCount(file.path("size").asLong(0)) > 0) {
+                selectedChunkLimits.put(file.path("path").asText(), 1);
+                selectedChunks++;
+            }
+        }
+
+        Map<String, List<JsonNode>> filesByTopLevelDirectory = new LinkedHashMap<>();
+        for (JsonNode file : prioritizedFiles) {
+            String path = file.path("path").asText();
+            int slash = path.indexOf('/');
+            if (slash < 0) {
+                continue;
+            }
+            filesByTopLevelDirectory
+                    .computeIfAbsent(path.substring(0, slash), ignored -> new ArrayList<>())
+                    .add(file);
+        }
+
+        List<Map.Entry<String, List<JsonNode>>> topLevelDirectories =
+                new ArrayList<>(filesByTopLevelDirectory.entrySet());
+        topLevelDirectories.sort(
+                Comparator.comparingInt(
+                                (Map.Entry<String, List<JsonNode>> entry) ->
+                                        topLevelDirectoryPriority(entry.getKey(), entry.getValue()))
+                        .thenComparing(Map.Entry::getKey));
+
+        for (Map.Entry<String, List<JsonNode>> directory : topLevelDirectories) {
+            if (selectedChunks >= maxChunks) {
+                break;
+            }
+            JsonNode representative = directory.getValue().stream()
+                    .filter(file -> estimateChunkCount(file.path("size").asLong(0)) > 0)
+                    .min(Comparator
+                            .comparingInt((JsonNode file) ->
+                                    isSourceFile(file.path("path").asText()) ? 0 : 1)
+                            .thenComparingInt(file ->
+                                    quickIndexPriority(file.path("path").asText()))
+                            .thenComparing(file -> file.path("path").asText()))
+                    .orElse(null);
+            if (representative != null) {
+                selectedChunkLimits.put(representative.path("path").asText(), 1);
+                selectedChunks++;
+            }
+        }
+
         for (JsonNode file : prioritizedFiles) {
             if (selectedChunks >= maxChunks) {
                 break;
             }
-            if (estimateChunkCount(file.path("size").asLong(0)) > 0) {
-                selectedChunkLimits.put(file.path("path").asText(), 1);
+            String path = file.path("path").asText();
+            if (!selectedChunkLimits.containsKey(path)
+                    && estimateChunkCount(file.path("size").asLong(0)) > 0) {
+                selectedChunkLimits.put(path, 1);
                 selectedChunks++;
             }
         }
@@ -540,33 +602,66 @@ public class RepositoryIndexService {
     private static int quickIndexPriority(String path) {
         String lowerPath = path.toLowerCase();
         String fileName = lowerPath.substring(lowerPath.lastIndexOf('/') + 1);
-        if (fileName.startsWith("readme")) {
+        if (!lowerPath.contains("/") && fileName.startsWith("readme")) {
             return 0;
         }
-        if (Set.of("pom.xml", "build.gradle", "build.gradle.kts",
+        if (!lowerPath.contains("/") && Set.of("pom.xml", "build.gradle", "build.gradle.kts",
                 "package.json", "pyproject.toml", "go.mod",
                 "cargo.toml", "settings.gradle", "settings.gradle.kts")
                 .contains(fileName)) {
             return 1;
         }
+        if (fileName.startsWith("readme")) {
+            return lowerPath.indexOf('/') == lowerPath.lastIndexOf('/') ? 2 : 4;
+        }
         if (Set.of("application.java", "main.java", "app.java",
                 "index.js", "index.ts", "main.py", "main.go")
                 .contains(fileName)) {
-            return 2;
-        }
-        if (lowerPath.contains("/src/main/") || lowerPath.startsWith("src/main/")) {
             return 3;
         }
-        if (lowerPath.contains("/src/") || lowerPath.startsWith("src/")) {
+        if (lowerPath.contains("/src/main/") || lowerPath.startsWith("src/main/")) {
             return 4;
         }
-        if (lowerPath.contains("config")) {
+        if (lowerPath.contains("/src/") || lowerPath.startsWith("src/")) {
             return 5;
         }
-        if (lowerPath.startsWith("docs/") || lowerPath.contains("/docs/")) {
+        if (lowerPath.contains("config")) {
             return 6;
         }
-        return 7;
+        if (lowerPath.startsWith("docs/") || lowerPath.contains("/docs/")) {
+            return 7;
+        }
+        return 8;
+    }
+
+    private static int topLevelDirectoryPriority(
+            String directory,
+            List<JsonNode> files) {
+        String lowerDirectory = directory.toLowerCase();
+        if (Set.of("java", "python", "node", "src", "app", "lib")
+                .contains(lowerDirectory)) {
+            return 0;
+        }
+        int sourceFileCount = (int) files.stream()
+                .filter(file -> isSourceFile(file.path("path").asText()))
+                .count();
+        return sourceFileCount == 0 ? 2 : 1;
+    }
+
+    private static boolean isSourceFile(String path) {
+        String lowerPath = path.toLowerCase();
+        return lowerPath.endsWith(".java")
+                || lowerPath.endsWith(".py")
+                || lowerPath.endsWith(".js")
+                || lowerPath.endsWith(".jsx")
+                || lowerPath.endsWith(".ts")
+                || lowerPath.endsWith(".tsx")
+                || lowerPath.endsWith(".go")
+                || lowerPath.endsWith(".rs")
+                || lowerPath.endsWith(".kt")
+                || lowerPath.endsWith(".cs")
+                || lowerPath.endsWith(".cpp")
+                || lowerPath.endsWith(".c");
     }
 
     record SelectedIndexFile(JsonNode file, int chunkLimit) {
@@ -577,13 +672,24 @@ public class RepositoryIndexService {
             String repository,
             String branch,
             String path) {
-        String rawUrl = "https://raw.githubusercontent.com/"
-                + owner + "/" + repository + "/" + branch + "/" + path;
+        String rawUrl = rawGitHubFileUrl(owner, repository, branch, path);
         String content = rawContentClient.get()
                 .uri(URI.create(rawUrl))
                 .retrieve()
                 .body(String.class);
         return new DownloadedFile(path, content);
+    }
+
+    static String rawGitHubFileUrl(
+            String owner,
+            String repository,
+            String branch,
+            String path) {
+        return "https://raw.githubusercontent.com/"
+                + UriUtils.encodePathSegment(owner, StandardCharsets.UTF_8)
+                + "/" + UriUtils.encodePathSegment(repository, StandardCharsets.UTF_8)
+                + "/" + UriUtils.encodePathSegment(branch, StandardCharsets.UTF_8)
+                + "/" + UriUtils.encodePath(path, StandardCharsets.UTF_8);
     }
 
     private record DownloadedFile(String path, String content) {
@@ -745,14 +851,36 @@ public class RepositoryIndexService {
                 || lower.endsWith(".tsx")
                 || lower.endsWith(".py")
                 || lower.endsWith(".go")
+                || lower.endsWith(".rs")
+                || lower.endsWith(".kt")
+                || lower.endsWith(".kts")
+                || lower.endsWith(".cs")
+                || lower.endsWith(".c")
+                || lower.endsWith(".h")
+                || lower.endsWith(".cpp")
+                || lower.endsWith(".hpp")
+                || lower.endsWith(".rb")
+                || lower.endsWith(".php")
+                || lower.endsWith(".swift")
+                || lower.endsWith(".scala")
                 || lower.endsWith(".html")
                 || lower.endsWith(".css")
+                || lower.endsWith(".scss")
+                || lower.endsWith(".sass")
+                || lower.endsWith(".less")
+                || lower.endsWith(".vue")
+                || lower.endsWith(".svelte")
                 || lower.endsWith(".sql")
                 || lower.endsWith(".xml")
                 || lower.endsWith(".yml")
                 || lower.endsWith(".yaml")
                 || lower.endsWith(".properties")
                 || lower.endsWith(".md")
+                || lower.endsWith(".mdx")
+                || lower.endsWith(".sh")
+                || lower.endsWith(".ini")
+                || lower.endsWith(".conf")
+                || lower.endsWith(".dockerfile")
                 || lowerendsWithConfig(lower);
     }
 

@@ -2,6 +2,7 @@ package com.repoinsight.repository.service;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.chat.client.ChatClient;
+import org.mockito.ArgumentCaptor;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -34,6 +35,33 @@ class AiSummaryServiceTest {
                 "pom.xml");
 
         assertThat(summary).isEqualTo("Generated summary");
+    }
+
+    @Test
+    void generateSummary_RequestsReportThreeStructureWithEvidenceGuardrails() {
+        ChatClient client = mock(ChatClient.class);
+        ChatClient.ChatClientRequestSpec requestSpec = mock(ChatClient.ChatClientRequestSpec.class);
+        ChatClient.CallResponseSpec responseSpec = mock(ChatClient.CallResponseSpec.class);
+        ChatClient.Builder builder = mock(ChatClient.Builder.class);
+
+        when(builder.build()).thenReturn(client);
+        when(client.prompt()).thenReturn(requestSpec);
+        when(requestSpec.user(anyString())).thenReturn(requestSpec);
+        when(requestSpec.call()).thenReturn(responseSpec);
+        when(responseSpec.content()).thenReturn("Generated summary");
+
+        AiSummaryService service = new AiSummaryService(builder);
+        service.generateSummary("demo-repo", "Demo", "# Demo", "Java", "pom.xml");
+
+        ArgumentCaptor<String> prompt = ArgumentCaptor.forClass(String.class);
+        org.mockito.Mockito.verify(requestSpec).user(prompt.capture());
+        assertThat(prompt.getValue())
+                .contains("**Overall Impression:**")
+                .contains("**Detailed Breakdown:**")
+                .contains("**Evidence Analysis & Key Considerations:**")
+                .contains("**Potential Improvements:**")
+                .contains("under 400 words")
+                .contains("Do not invent features, dependencies, or architecture.");
     }
 
     @Test

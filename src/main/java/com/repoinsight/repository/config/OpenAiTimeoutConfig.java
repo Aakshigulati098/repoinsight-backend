@@ -11,6 +11,6 @@ public class OpenAiTimeoutConfig {
 
     @Bean
     OpenAiHttpClientBuilderCustomizer openAiHttpClientBuilderCustomizer() {
-        return builder -> builder.timeout(Duration.ofSeconds(6));
+        return builder -> builder.timeout(Duration.ofSeconds(10));
     }
 }

@@ -43,6 +43,13 @@ public class RepositoryChatService {
     private static final int MAX_CONTEXT_CHARS = 4500;
     private static final int MAX_FILE_INDEX_CHARS = 5000;
     private static final int MAX_CHAT_COMPLETION_TOKENS = 384;
+    private static final int MAX_AUTH_SCAN_FILES = 200;
+    private static final int AUTH_SCAN_BATCH_SIZE = 16;
+    private static final Pattern AUTHENTICATION_EVIDENCE = Pattern.compile(
+            "(?i)\\b(authentication|authenticate|authorization|authorisation|login|log\\s*in|"
+                    + "sign\\s*in|password|credential|jwt|oauth2|securityfilterchain|"
+                    + "enablewebsecurity|userdetailsservice|hasrole|hasauthority)\\b"
+                    + "|spring[-.]security");
     private static final Pattern JAVA_IMPORT = Pattern.compile(
             "(?m)^\\s*import\\s+(?:static\\s+)?([\\w.]+)(\\.\\*)?\\s*;");
     private static final Pattern PACKAGE_DECLARATION = Pattern.compile(
@@ -111,7 +118,16 @@ public class RepositoryChatService {
                         "Repository not found: " + repositoryId));
 
         long retrievalStartedNanos = System.nanoTime();
-        if (!isProjectStructureQuestion(latestQuestion)) {
+        boolean overviewQuestion = isRepositoryOverviewQuestion(latestQuestion);
+        boolean fileCountQuestion = isFileCountQuestion(latestQuestion);
+        boolean readmeQuestion = isReadmeQuestion(latestQuestion);
+        boolean databaseQuestion = isDatabaseQuestion(latestQuestion);
+        boolean authenticationQuestion = isAuthenticationQuestion(
+                latestQuestion.toLowerCase(Locale.ROOT));
+        boolean directoryQuestion = isDirectoryDescriptionQuestion(latestQuestion);
+        if (!isProjectStructureQuestion(latestQuestion)
+                && !overviewQuestion && !fileCountQuestion && !readmeQuestion
+                && !databaseQuestion && !authenticationQuestion && !directoryQuestion) {
             Map<String, Object> ragAnswer = answerUsingRag(
                     repository, repositoryId, latestQuestion, historyContext);
 
@@ -159,6 +175,29 @@ public class RepositoryChatService {
         }
         if (isProjectStructureQuestion(latestQuestion)) {
             return answerProjectStructure(repositoryId, tree);
+        }
+        if (overviewQuestion) {
+            return answerRepositoryOverview(
+                    repositoryId, repository, tree, owner, repo, selectedBranch);
+        }
+        if (fileCountQuestion) {
+            return answerFileCount(repositoryId, tree);
+        }
+        if (readmeQuestion) {
+            return answerReadmeQuestion(
+                    repositoryId, tree, owner, repo, selectedBranch);
+        }
+        if (directoryQuestion) {
+            return answerDirectoryQuestion(
+                    repositoryId, latestQuestion, tree, owner, repo, selectedBranch);
+        }
+        if (databaseQuestion) {
+            return answerDatabaseQuestion(
+                    repositoryId, tree, owner, repo, selectedBranch);
+        }
+        if (authenticationQuestion) {
+            return answerAuthenticationQuestion(
+                    repositoryId, tree, owner, repo, selectedBranch);
         }
         long treeFetchMillis = elapsedMillis(retrievalStartedNanos);
         String repositoryFileIndex = buildRepositoryFileIndex(tree, latestQuestion);
@@ -340,11 +379,11 @@ public class RepositoryChatService {
         } catch (RuntimeException exception) {
             log.error("Repository chat model request failed: repositoryId={}",
                     repositoryId, exception);
-            return buildFallbackResponse(
+            return buildEvidenceFallback(
                     repositoryId,
                     latestQuestion,
-                    sources.keySet(),
-                    "The AI model request failed, so the retrieved source could not be analyzed.");
+                    sources,
+                    "The AI model request failed.");
         }
         long generationMillis = elapsedMillis(generationStartedNanos);
 
@@ -557,8 +596,8 @@ public class RepositoryChatService {
 
     private String fetchSource(String owner, String repo, String branch, String path) {
         try {
-            String rawUrl = "https://raw.githubusercontent.com/" + owner + "/" + repo
-                    + "/" + branch + "/" + path;
+            String rawUrl = RepositoryIndexService.rawGitHubFileUrl(
+                    owner, repo, branch, path);
             return rawGitHubClient.get().uri(rawUrl).retrieve().body(String.class);
         } catch (RestClientException exception) {
             log.warn("Could not retrieve GitHub source file: repository={}, path={}",
@@ -843,10 +882,16 @@ public class RepositoryChatService {
 
     private int filePriority(String path, String question) {
         String lower = path.toLowerCase(Locale.ROOT);
-        int priority = -pathQuestionScore(path, question) * 10;
+        int pathScore = pathQuestionScore(path, question);
+        int priority = -pathScore * 10;
         String fileName = lower.substring(lower.lastIndexOf('/') + 1);
         if (fileName.matches("readme(?:\\.[a-z0-9]+)?")) {
-            priority -= 8;
+            priority += pathScore == 0 ? 20 : -8;
+            if (path.indexOf('/') < 0) {
+                priority -= 30;
+            }
+        } else if (pathScore == 0) {
+            priority += 100;
         }
         if (isTestPath(path) && !questionMentionsTests(question)) {
             priority += 1000;
@@ -854,16 +899,18 @@ public class RepositoryChatService {
         return priority;
     }
 
-    private static int pathQuestionScore(String path, String question) {
+    static int pathQuestionScore(String path, String question) {
         Set<String> terms = questionTerms(question);
         String lowerPath = path.toLowerCase(Locale.ROOT);
         String fileName = lowerPath.substring(lowerPath.lastIndexOf('/') + 1);
         int score = 0;
         for (String term : terms) {
-            if (fileName.contains(term)) {
-                score += 3;
-            } else if (lowerPath.contains(term)) {
-                score++;
+            for (String expandedTerm : expandQueryTerm(term)) {
+                if (fileName.contains(expandedTerm)) {
+                    score += 3;
+                } else if (lowerPath.contains(expandedTerm)) {
+                    score++;
+                }
             }
         }
         return score;
@@ -875,7 +922,9 @@ public class RepositoryChatService {
                 "is", "are", "does", "do", "how", "what", "which", "this",
                 "that", "it", "its", "with", "from", "using", "please", "file",
                 "files", "repository", "repo", "project", "code", "codebase",
-                "have", "has", "any", "show", "tell", "me", "about");
+                "have", "has", "any", "show", "tell", "me", "about", "there",
+                "some", "most", "easy", "easiest", "thing", "things", "us",
+                "implemented");
         Set<String> terms = new LinkedHashSet<>();
         for (String token : question.toLowerCase(Locale.ROOT).split("[^a-z0-9]+")) {
             if (token.length() > 1 && !stopWords.contains(token)) {
@@ -883,6 +932,76 @@ public class RepositoryChatService {
             }
         }
         return terms;
+    }
+
+    private static Set<String> expandQueryTerm(String term) {
+        Set<String> expanded = new LinkedHashSet<>();
+        expanded.add(term);
+        if (term.startsWith("auth")) {
+            expanded.add("auth");
+            expanded.add("security");
+        }
+        if (term.equals("login") || term.equals("signin")) {
+            expanded.add("auth");
+            expanded.add("authentication");
+        }
+        if (term.equals("permission") || term.equals("permissions")
+                || term.equals("role") || term.equals("roles")) {
+            expanded.add("authorization");
+            expanded.add("access");
+        }
+        return expanded;
+    }
+
+    static Map<String, Object> buildEvidenceFallback(
+            Long repositoryId,
+            String question,
+            Map<String, String> sources,
+            String limitation) {
+        Set<String> terms = questionTerms(question).stream()
+                .flatMap(term -> expandQueryTerm(term).stream())
+                .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
+        StringBuilder answer = new StringBuilder(limitation)
+                .append(" I can still report evidence from the retrieved files, but cannot infer behavior beyond it.");
+
+        int excerptsAdded = 0;
+        for (Map.Entry<String, String> source : sources.entrySet()) {
+            List<String> relevantLines = new ArrayList<>();
+            String[] lines = source.getValue().split("\\R");
+            for (int i = 0; i < lines.length && relevantLines.size() < 3; i++) {
+                String lowerLine = lines[i].toLowerCase(Locale.ROOT);
+                boolean relevant = terms.stream().anyMatch(term ->
+                        List.of(lowerLine.split("[^a-z0-9]+")).stream()
+                                .anyMatch(token -> token.contains(term)));
+                if (relevant && !lines[i].isBlank()) {
+                    relevantLines.add("L" + (i + 1) + ": " + lines[i].trim());
+                }
+            }
+            if (!relevantLines.isEmpty()) {
+                answer.append("\n\nEvidence in `").append(source.getKey()).append("`:");
+                relevantLines.forEach(line -> answer.append("\n- ").append(line));
+                excerptsAdded += relevantLines.size();
+                if (excerptsAdded >= 8) {
+                    break;
+                }
+            }
+        }
+
+        if (excerptsAdded == 0) {
+            answer.append("\n\nThe retrieved files do not contain a clear textual match for the question, ")
+                    .append("so they are not enough to confirm an answer. Retrieved files: ")
+                    .append(sources.isEmpty()
+                            ? "none"
+                            : String.join(", ", sources.keySet()))
+                    .append('.');
+        }
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("repositoryId", repositoryId);
+        response.put("answer", answer.toString());
+        response.put("sources", sources.keySet());
+        response.put("retrieval", "REPOSITORY_EVIDENCE_FALLBACK");
+        return response;
     }
 
     private String buildRepositoryFileIndex(JsonNode tree, String question) {
@@ -1002,7 +1121,7 @@ public class RepositoryChatService {
             int score = scoreChunk(document, question);
 
             // Avoid generating an answer from semantically weak candidates.
-            if (score < 3 && selected.isEmpty()) {
+            if (score < 4 && selected.isEmpty()) {
                 continue;
             }
 
@@ -1087,20 +1206,20 @@ public class RepositoryChatService {
         } catch (RuntimeException exception) {
             log.warn("RAG generation failed: repositoryId={}",
                     repositoryId, exception);
-            return buildFallbackResponse(
+            return buildEvidenceFallback(
                     repositoryId,
                     question,
-                    sourcePaths,
+                    selectedSourceContent(selected),
                     "The AI model did not respond within the configured timeout.");
         }
 
         if (answer == null || answer.isBlank()) {
             log.warn("RAG generation returned an empty answer: repositoryId={}",
                     repositoryId);
-            return buildFallbackResponse(
+            return buildEvidenceFallback(
                     repositoryId,
                     question,
-                    sourcePaths,
+                    selectedSourceContent(selected),
                     "The AI model returned an empty answer.");
         }
 
@@ -1120,6 +1239,17 @@ public class RepositoryChatService {
                 elapsedMillis(generationStartedNanos));
 
         return response;
+    }
+
+    private Map<String, String> selectedSourceContent(List<Document> documents) {
+        Map<String, String> contentByPath = new LinkedHashMap<>();
+        for (Document document : documents) {
+            Object path = document.getMetadata().get("filePath");
+            if (path != null && document.getText() != null) {
+                contentByPath.put(path.toString(), document.getText());
+            }
+        }
+        return contentByPath;
     }
 
     private Map<String, Object> buildFallbackResponse(
@@ -1165,11 +1295,9 @@ public class RepositoryChatService {
                                 || lowerQuestion.contains("implemented"));
     }
 
-    private boolean isAuthenticationQuestion(String lowerQuestion) {
-        return lowerQuestion.contains("authentication")
+    static boolean isAuthenticationQuestion(String lowerQuestion) {
+        return lowerQuestion.contains("auth")
                 || lowerQuestion.contains("authenticate")
-                || lowerQuestion.contains("authorization")
-                || lowerQuestion.contains("authorisation")
                 || lowerQuestion.contains("jwt")
                 || lowerQuestion.contains("login")
                 || lowerQuestion.contains("log in")
@@ -1179,6 +1307,148 @@ public class RepositoryChatService {
                 || lowerQuestion.contains("access control")
                 || lowerQuestion.contains("permissions")
                 || lowerQuestion.contains("roles");
+    }
+
+    private Map<String, Object> answerAuthenticationQuestion(
+            Long repositoryId,
+            JsonNode tree,
+            String owner,
+            String repo,
+            String branch) {
+        List<String> paths = new ArrayList<>();
+        for (JsonNode item : tree.path("tree")) {
+            if (!"blob".equals(item.path("type").asText())) {
+                continue;
+            }
+            String path = item.path("path").asText();
+            long size = item.path("size").asLong(0);
+            if (isAuthenticationScanFile(path, size)) {
+                paths.add(path);
+            }
+        }
+        paths.sort(Comparator
+                .comparingInt(RepositoryChatService::authenticationPathPriority)
+                .thenComparing(String::compareToIgnoreCase));
+        List<String> scannedPaths = paths.stream()
+                .limit(MAX_AUTH_SCAN_FILES)
+                .toList();
+
+        Map<String, String> sources = new LinkedHashMap<>();
+        try (var sourceExecutor = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (int offset = 0; offset < scannedPaths.size(); offset += AUTH_SCAN_BATCH_SIZE) {
+                int batchEnd = Math.min(offset + AUTH_SCAN_BATCH_SIZE, scannedPaths.size());
+                List<String> batchPaths = scannedPaths.subList(offset, batchEnd);
+                List<CompletableFuture<String>> downloads = batchPaths.stream()
+                        .map(path -> CompletableFuture.supplyAsync(
+                                () -> fetchSource(owner, repo, branch, path),
+                                sourceExecutor))
+                        .toList();
+                for (int i = 0; i < batchPaths.size(); i++) {
+                    String content = downloads.get(i).join();
+                    if (content != null && !content.isBlank()) {
+                        sources.put(batchPaths.get(i), content);
+                    }
+                }
+            }
+        }
+
+        String answer = buildAuthenticationEvidenceAnswer(
+                sources, scannedPaths.size(), paths.size() > scannedPaths.size());
+        Set<String> citedSources = new LinkedHashSet<>();
+        Matcher citation = Pattern.compile("`([^`]+)`").matcher(answer);
+        while (citation.find()) {
+            if (sources.containsKey(citation.group(1))) {
+                citedSources.add(citation.group(1));
+            }
+        }
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("repositoryId", repositoryId);
+        response.put("answer", answer);
+        response.put("sources", citedSources);
+        response.put("retrieval", "GITHUB_AUTHENTICATION_SCAN");
+        return response;
+    }
+
+    private boolean isAuthenticationScanFile(String path, long size) {
+        if (!isUsefulFile(path, size) || isTestPath(path)) {
+            return false;
+        }
+        String lowerPath = path.toLowerCase(Locale.ROOT);
+        return lowerPath.endsWith(".java")
+                || lowerPath.endsWith(".kt")
+                || lowerPath.endsWith(".kts")
+                || lowerPath.endsWith(".js")
+                || lowerPath.endsWith(".jsx")
+                || lowerPath.endsWith(".ts")
+                || lowerPath.endsWith(".tsx")
+                || lowerPath.endsWith(".py")
+                || lowerPath.endsWith(".go")
+                || lowerPath.endsWith(".rb")
+                || lowerPath.endsWith(".php")
+                || lowerPath.endsWith(".cs")
+                || lowerPath.endsWith(".yml")
+                || lowerPath.endsWith(".yaml")
+                || lowerPath.endsWith(".properties")
+                || lowerPath.endsWith(".json")
+                || lowerPath.endsWith(".xml")
+                || lowerPath.endsWith(".toml");
+    }
+
+    private static int authenticationPathPriority(String path) {
+        String lowerPath = path.toLowerCase(Locale.ROOT);
+        if (lowerPath.matches(".*(auth|security|login|oauth|jwt|credential|userdetails).*")) {
+            return 0;
+        }
+        if (lowerPath.contains("/src/main/") || lowerPath.startsWith("src/main/")) {
+            return 1;
+        }
+        if (lowerPath.matches(".*(config|filter|middleware|controller|service).*")) {
+            return 2;
+        }
+        return 3;
+    }
+
+    static String buildAuthenticationEvidenceAnswer(
+            Map<String, String> sources,
+            int scannedFileCount,
+            boolean scanTruncated) {
+        List<String> matchingLines = new ArrayList<>();
+        Set<String> matchingPaths = new LinkedHashSet<>();
+        for (Map.Entry<String, String> source : sources.entrySet()) {
+            String[] lines = source.getValue().split("\\R");
+            for (int i = 0; i < lines.length; i++) {
+                if (AUTHENTICATION_EVIDENCE.matcher(lines[i]).find()) {
+                    matchingPaths.add(source.getKey());
+                    if (matchingLines.size() < 12) {
+                        matchingLines.add("- `" + source.getKey() + "` L"
+                                + (i + 1) + ": " + lines[i].trim());
+                    }
+                }
+            }
+        }
+
+        if (matchingPaths.isEmpty()) {
+            return "I found no clear authentication or authorization implementation in "
+                    + scannedFileCount + " production source/configuration files scanned. "
+                    + "This is evidence that it wasn't found in that scan, not proof that no "
+                    + "dynamic or externally provided authentication exists."
+                    + (scanTruncated
+                            ? " The repository has additional eligible files that were not scanned."
+                            : "");
+        }
+
+        StringBuilder answer = new StringBuilder(
+                "The repository contains authentication/security-related code indicators in ")
+                .append(matchingPaths.size())
+                .append(" scanned files. Relevant lines:\n")
+                .append(String.join("\n", matchingLines));
+        if (scanTruncated) {
+            answer.append("\n\nThe scan was limited to the most relevant ")
+                    .append(scannedFileCount)
+                    .append(" files; other files may also contain related code.");
+        }
+        return answer.toString();
     }
 
     private boolean isProjectStructureQuestion(String question) {
@@ -1193,14 +1463,348 @@ public class RepositoryChatService {
                 || lowerQuestion.contains("how is the project organized");
     }
 
+    static boolean isDirectoryDescriptionQuestion(String question) {
+        String normalized = question.toLowerCase(Locale.ROOT)
+                .replace('_', '-')
+                .replaceAll("[^a-z0-9-]+", " ")
+                .trim();
+        if (normalized.contains(" folder") || normalized.contains(" directory")) {
+            return true;
+        }
+        if (normalized.matches(
+                ".*\\bwhat does [a-z0-9]+(?:-[a-z0-9]+)*(?:/)?"
+                        + " (?:contain|contains|include|includes|hold|holds|tell|tells).*")) {
+            return true;
+        }
+        return normalized.matches(
+                ".*\\bwhat (?:is|does) [a-z0-9]+(?:-[a-z0-9]+)+"
+                        + "(?: tells?(?: us)?| do| say)?\\b.*")
+                && !isRepositoryOverviewQuestion(question);
+    }
+
+    static boolean isFileCountQuestion(String question) {
+        String normalized = question.toLowerCase(Locale.ROOT)
+                .replaceAll("[^a-z0-9]+", " ")
+                .trim();
+        return normalized.contains("how many files")
+                || normalized.contains("total files")
+                || normalized.contains("number of files")
+                || normalized.contains("files does this project have")
+                || normalized.contains("files does this repository have");
+    }
+
+    static boolean isReadmeQuestion(String question) {
+        String normalized = question.toLowerCase(Locale.ROOT)
+                .replaceAll("[^a-z0-9]+", " ")
+                .trim();
+        return normalized.contains("readme")
+                && (normalized.contains("what")
+                        || normalized.contains("say")
+                        || normalized.contains("about")
+                        || normalized.contains("summar")
+                        || normalized.contains("explain")
+                        || normalized.contains("describe"));
+    }
+
+    static boolean isDatabaseQuestion(String question) {
+        String normalized = question.toLowerCase(Locale.ROOT)
+                .replaceAll("[^a-z0-9]+", " ")
+                .trim();
+        return normalized.contains("database")
+                || normalized.matches(".*\\bdb\\b.*")
+                || normalized.contains("collection")
+                || normalized.contains("schema")
+                || normalized.contains("sql table")
+                || normalized.contains("database table");
+    }
+
+    private Map<String, Object> answerFileCount(Long repositoryId, JsonNode tree) {
+        long count = 0;
+        for (JsonNode item : tree.path("tree")) {
+            if ("blob".equals(item.path("type").asText())) {
+                count++;
+            }
+        }
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("repositoryId", repositoryId);
+        response.put("answer", "The repository has " + count
+                + " files in the GitHub file tree.");
+        response.put("sources", Set.of());
+        response.put("retrieval", "GITHUB_TREE");
+        return response;
+    }
+
+    private Map<String, Object> answerReadmeQuestion(
+            Long repositoryId,
+            JsonNode tree,
+            String owner,
+            String repo,
+            String branch) {
+        List<String> paths = streamTreeFiles(tree).toList();
+        String readmePath = paths.stream()
+                .filter(path -> path.substring(path.lastIndexOf('/') + 1)
+                        .equalsIgnoreCase("README.md"))
+                .min(Comparator.comparingInt(path -> path.contains("/") ? 1 : 0))
+                .orElse(null);
+        String readme = readmePath == null
+                ? null
+                : fetchSource(owner, repo, branch, readmePath);
+        String summary = extractReadmeSummary(readme);
+        String answer = summary.isBlank()
+                ? "I couldn't retrieve a readable project README from the GitHub file tree."
+                : "The project README (`" + readmePath + "`) describes the repository as: "
+                        + summary;
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("repositoryId", repositoryId);
+        response.put("answer", answer);
+        response.put("sources", readmePath == null ? Set.of() : Set.of(readmePath));
+        response.put("retrieval", "GITHUB_README");
+        return response;
+    }
+
+    private Map<String, Object> answerDatabaseQuestion(
+            Long repositoryId,
+            JsonNode tree,
+            String owner,
+            String repo,
+            String branch) {
+        List<String> paths = streamTreeFiles(tree)
+                .filter(this::isUsefulDatabaseEvidenceFile)
+                .sorted(Comparator
+                        .comparingInt(this::databasePathPriority)
+                        .thenComparing(String::compareToIgnoreCase))
+                .limit(20)
+                .toList();
+
+        Map<String, String> sources = new LinkedHashMap<>();
+        try (var sourceExecutor = Executors.newVirtualThreadPerTaskExecutor()) {
+            List<CompletableFuture<String>> downloads = paths.stream()
+                    .map(path -> CompletableFuture.supplyAsync(
+                            () -> fetchSource(owner, repo, branch, path),
+                            sourceExecutor))
+                    .toList();
+            for (int i = 0; i < paths.size(); i++) {
+                String content = downloads.get(i).join();
+                if (content != null && !content.isBlank()) {
+                    sources.put(paths.get(i), content);
+                }
+            }
+        }
+
+        Pattern databaseEvidence = Pattern.compile(
+                "(?i)@(?:entity|table|document|collection)\\b"
+                        + "|@(?:table|document)\\s*\\("
+                        + "|(?:create|alter)\\s+table\\b"
+                        + "|(?:collection|table)\\s*\\(\\s*[\"'][^\"']+[\"']"
+                        + "|(?:spring\\.data\\.(?:mongodb|jpa)|datasource\\.)");
+        StringBuilder answer = new StringBuilder();
+        Set<String> evidenceSources = new LinkedHashSet<>();
+        int evidenceCount = 0;
+        for (Map.Entry<String, String> source : sources.entrySet()) {
+            List<String> matchingLines = new ArrayList<>();
+            String[] lines = source.getValue().split("\\R");
+            for (int i = 0; i < lines.length && matchingLines.size() < 4; i++) {
+                if (databaseEvidence.matcher(lines[i]).find()) {
+                    matchingLines.add("L" + (i + 1) + ": " + lines[i].trim());
+                }
+            }
+            if (!matchingLines.isEmpty()) {
+                evidenceSources.add(source.getKey());
+                answer.append("Database-related declarations found in `")
+                        .append(source.getKey()).append("`:\n");
+                matchingLines.forEach(line -> answer.append("- ").append(line).append('\n'));
+                evidenceCount += matchingLines.size();
+                if (evidenceCount >= 12) {
+                    break;
+                }
+            }
+        }
+
+        if (evidenceCount == 0) {
+            answer.append("I didn't find explicit database table or collection declarations ")
+                    .append("in the likely schema, model, persistence, repository, or configuration ")
+                    .append("files I scanned. This doesn't rule out dynamic database access elsewhere.");
+            evidenceSources.addAll(sources.keySet());
+        }
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("repositoryId", repositoryId);
+        response.put("answer", answer.toString().trim());
+        response.put("sources", evidenceSources);
+        response.put("retrieval", "GITHUB_DATABASE_SCAN");
+        return response;
+    }
+
+    private boolean isUsefulDatabaseEvidenceFile(String path) {
+        String lowerPath = path.toLowerCase(Locale.ROOT);
+        if (!isUsefulFile(path, 100)) {
+            return false;
+        }
+        String fileName = lowerPath.substring(lowerPath.lastIndexOf('/') + 1);
+        String relevantPath = lowerPath.replace('-', ' ').replace('_', ' ');
+        return relevantPath.contains("database")
+                || relevantPath.contains("schema")
+                || relevantPath.contains("collection")
+                || relevantPath.contains("entity")
+                || relevantPath.contains("persistence")
+                || relevantPath.contains("repository")
+                || relevantPath.contains("model")
+                || relevantPath.contains("migration")
+                || fileName.contains("config")
+                || fileName.equals("pom.xml")
+                || fileName.equals("package.json")
+                || fileName.equals("requirements.txt")
+                || fileName.equals("pyproject.toml");
+    }
+
+    private int databasePathPriority(String path) {
+        String lowerPath = path.toLowerCase(Locale.ROOT);
+        if (lowerPath.contains("schema") || lowerPath.contains("migration")
+                || lowerPath.contains("collection") || lowerPath.contains("entity")) {
+            return 0;
+        }
+        if (lowerPath.contains("database") || lowerPath.contains("persistence")
+                || lowerPath.contains("repository") || lowerPath.contains("model")) {
+            return 1;
+        }
+        return 2;
+    }
+
+    private Map<String, Object> answerDirectoryQuestion(
+            Long repositoryId,
+            String question,
+            JsonNode tree,
+            String owner,
+            String repo,
+            String branch) {
+        List<String> paths = streamTreeFiles(tree).toList();
+        String directory = findQuestionDirectory(paths, question);
+        if (directory == null) {
+            return buildFallbackResponse(
+                    repositoryId,
+                    question,
+                    Set.of(),
+                    "I couldn't match the folder mentioned in your question to a directory in the GitHub file tree.");
+        }
+
+        List<String> directoryFiles = paths.stream()
+                .filter(path -> path.startsWith(directory + "/"))
+                .sorted(String::compareToIgnoreCase)
+                .toList();
+        String readmePath = findDirectoryReadme(directoryFiles, directory);
+        String readme = readmePath == null
+                ? null
+                : fetchSource(owner, repo, branch, readmePath);
+        String readmeSummary = extractReadmeSummary(readme);
+
+        StringBuilder answer = new StringBuilder("The `")
+                .append(directory)
+                .append("/` folder contains ")
+                .append(directoryFiles.size())
+                .append(directoryFiles.size() == 1 ? " file" : " files")
+                .append(" in the GitHub file tree.");
+        if (readmeSummary != null && !readmeSummary.isBlank()) {
+            answer.append("\n\nIts README describes it as: ")
+                    .append(readmeSummary);
+        } else {
+            answer.append("\n\nI couldn't find a readable README inside this folder, ")
+                    .append("so its purpose can't be confirmed from the available documentation. ")
+                    .append("Some files in it are: ");
+            answer.append(directoryFiles.stream()
+                    .limit(8)
+                    .map(path -> "`" + path + "`")
+                    .collect(java.util.stream.Collectors.joining(", ")));
+            if (directoryFiles.size() > 8) {
+                answer.append(", and more");
+            }
+            answer.append('.');
+        }
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("repositoryId", repositoryId);
+        response.put("answer", answer.toString());
+        response.put("sources", readmePath == null ? Set.of() : Set.of(readmePath));
+        response.put("retrieval", "GITHUB_DIRECTORY");
+        return response;
+    }
+
+    static String findQuestionDirectory(List<String> paths, String question) {
+        String normalizedQuestion = question.toLowerCase(Locale.ROOT)
+                .replace('-', ' ')
+                .replace('_', ' ');
+        List<String> directories = paths.stream()
+                .flatMap(path -> {
+                    List<String> parents = new ArrayList<>();
+                    int slash = path.indexOf('/');
+                    while (slash >= 0) {
+                        parents.add(path.substring(0, slash));
+                        slash = path.indexOf('/', slash + 1);
+                    }
+                    return parents.stream();
+                })
+                .distinct()
+                .filter(directory -> containsPhrase(
+                        normalizedQuestion,
+                        directory.substring(directory.lastIndexOf('/') + 1)
+                                .toLowerCase(Locale.ROOT)
+                                .replace('-', ' ')
+                                .replace('_', ' ')))
+                .sorted(Comparator
+                        .comparingInt((String directory) -> directory.contains("/")
+                                && containsPhrase(
+                                normalizedQuestion,
+                                directory.toLowerCase(Locale.ROOT)
+                                        .replace('-', ' ')
+                                        .replace('_', ' ')) ? 0 : 1)
+                        .thenComparingInt(directory -> directory.split("/").length)
+                        .thenComparing(String::compareToIgnoreCase))
+                .toList();
+        return directories.stream()
+                .findFirst()
+                .orElse(null);
+    }
+
+    private static boolean containsPhrase(String text, String phrase) {
+        int start = text.indexOf(phrase);
+        while (start >= 0) {
+            int end = start + phrase.length();
+            boolean startsAtBoundary = start == 0
+                    || !Character.isLetterOrDigit(text.charAt(start - 1));
+            boolean endsAtBoundary = end == text.length()
+                    || (!Character.isLetterOrDigit(text.charAt(end))
+                            && text.charAt(end) != '/');
+            if (startsAtBoundary && endsAtBoundary) {
+                return true;
+            }
+            start = text.indexOf(phrase, start + 1);
+        }
+        return false;
+    }
+
+    private String findDirectoryReadme(List<String> paths, String directory) {
+        return paths.stream()
+                .filter(path -> path.substring(path.lastIndexOf('/') + 1)
+                        .toLowerCase(Locale.ROOT).matches("readme(?:\\.[a-z0-9]+)?"))
+                .min(Comparator
+                        .comparingInt((String path) -> path.substring(
+                                0, path.lastIndexOf('/')).equals(directory) ? 0 : 1)
+                        .thenComparingInt(path -> path.split("/").length)
+                        .thenComparing(String::compareToIgnoreCase))
+                .orElse(null);
+    }
+
     static boolean isRepositoryOverviewQuestion(String question) {
-        String lowerQuestion = question.toLowerCase(Locale.ROOT);
-        return lowerQuestion.contains("what does this repository do")
-                || lowerQuestion.contains("what does this repo do")
-                || lowerQuestion.contains("what does this project do")
-                || lowerQuestion.contains("what is this repository")
-                || lowerQuestion.contains("what is this repo")
-                || lowerQuestion.contains("what is this project for")
+        String lowerQuestion = question.toLowerCase(Locale.ROOT)
+                .replaceAll("[^a-z0-9]+", " ")
+                .trim();
+        return lowerQuestion.matches(
+                        ".*\\bwhat does (this |the )?(repository|repo|project)( do| does)?\\b.*")
+                || lowerQuestion.matches(
+                        ".*\\bwhat is (this |the )?(repository|repo|project)( about| for)?\\b.*")
+                || lowerQuestion.matches(
+                        ".*\\bwhat does (this |the )?(repository|repo|project) do\\b.*")
                 || lowerQuestion.contains("what is the purpose of this repository")
                 || lowerQuestion.contains("what is the purpose of this repo")
                 || lowerQuestion.contains("describe this repository")
@@ -1213,35 +1817,20 @@ public class RepositoryChatService {
 
     private Map<String, Object> answerRepositoryOverview(
             Long repositoryId,
-            RepositoryInfo repository) {
+            RepositoryInfo repository,
+            JsonNode tree,
+            String owner,
+            String repo,
+            String branch) {
         long startedNanos = System.nanoTime();
         String description = repository.getDescription();
-        String readmePath = null;
-        String readmeSummary = null;
-
-        try {
-            String[] parts = parseGitHubUrl(repository.getGithubUrl());
-            String branch = repository.getDefaultBranch();
-            String selectedBranch = branch == null || branch.isBlank() ? "main" : branch;
-            JsonNode tree = githubClient.get()
-                    .uri(uriBuilder -> uriBuilder
-                            .path("/repos/{owner}/{repo}/git/trees/{branch}")
-                            .queryParam("recursive", "1")
-                            .build(parts[0], parts[1], selectedBranch))
-                    .retrieve()
-                    .body(JsonNode.class);
-
-            if (tree != null && tree.has("tree")) {
-                readmePath = findReadmePath(tree);
-                if (readmePath != null) {
-                    String readme = fetchSource(
-                            parts[0], parts[1], selectedBranch, readmePath);
-                    readmeSummary = extractReadmeSummary(readme);
-                }
-            }
-        } catch (RestClientException | IllegalArgumentException exception) {
-            log.warn("Could not retrieve repository overview from GitHub: repositoryId={}",
-                    repositoryId, exception);
+        String readmePath = findReadmePath(tree);
+        String readme = readmePath == null
+                ? null
+                : fetchSource(owner, repo, branch, readmePath);
+        String readmeSummary = extractReadmeSummary(readme);
+        if (readmePath == null) {
+            log.info("No repository README found for overview: repositoryId={}", repositoryId);
         }
 
         StringBuilder answer = new StringBuilder();
@@ -1300,6 +1889,21 @@ public class RepositoryChatService {
     static String extractReadmeSummary(String readme) {
         if (readme == null || readme.isBlank()) {
             return "";
+        }
+        Matcher descriptionMatcher = Pattern.compile(
+                "(?m)^description:\\s*[\"']?(.*?)[\"']?\\s*$")
+                .matcher(readme);
+        if (readme.startsWith("---") && descriptionMatcher.find()) {
+            String description = descriptionMatcher.group(1).trim();
+            if (!description.isBlank()) {
+                return description;
+            }
+        }
+        if (readme.startsWith("---")) {
+            int frontMatterEnd = readme.indexOf("\n---", 3);
+            if (frontMatterEnd >= 0) {
+                readme = readme.substring(frontMatterEnd + 4).stripLeading();
+            }
         }
 
         List<String> paragraphs = new ArrayList<>();
@@ -1431,12 +2035,14 @@ public class RepositoryChatService {
                 ? ""
                 : pathValue.toString().toLowerCase(Locale.ROOT);
 
+        Set<String> textTerms = new LinkedHashSet<>(
+                List.of(text.split("[^a-z0-9]+")));
         int score = 0;
         for (String term : questionTerms(question)) {
             if (path.contains(term)) {
                 score += 5;
             }
-            if (text.contains(term)) {
+            if (textTerms.contains(term)) {
                 score += 2;
             }
         }
