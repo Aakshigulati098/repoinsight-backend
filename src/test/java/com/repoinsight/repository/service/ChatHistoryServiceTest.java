@@ -3,15 +3,37 @@ package com.repoinsight.repository.service;
 import com.repoinsight.repository.repository.ChatConversationRepository;
 import com.repoinsight.repository.repository.ChatMessageRepository;
 import com.repoinsight.repository.repository.RepositoryInfoRepository;
+import com.repoinsight.repository.entity.ChatMessage;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
+import java.util.List;
+
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 class ChatHistoryServiceTest {
+
+    @Test
+    void conversationContextContainsPriorMessagesWithoutEmbeddingLatestQuestion() {
+        ChatMessage userMessage = new ChatMessage();
+        userMessage.setRole("user");
+        userMessage.setContent("Explain the project structure");
+        ChatMessage assistantMessage = new ChatMessage();
+        assistantMessage.setRole("assistant");
+        assistantMessage.setContent("The repository has Java and Python modules.");
+
+        String context = ChatHistoryService.buildConversationContext(
+                List.of(userMessage, assistantMessage));
+
+        assertThat(context)
+                .contains("User: Explain the project structure")
+                .contains("Assistant: The repository has Java and Python modules.")
+                .doesNotContain("Latest question:");
+    }
 
     @Test
     void deleteChatRemovesMessagesBeforeConversation() {

@@ -5,10 +5,14 @@ import com.repoinsight.repository.repository.RepositoryInfoRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientException;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import tools.jackson.databind.JsonNode;
 
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -19,6 +23,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.concurrent.CompletableFuture;
@@ -31,11 +36,13 @@ import org.springframework.ai.vectorstore.VectorStore;
 @Service
 public class RepositoryChatService {
 
-    private static final int MAX_FILES = 6;
+    private static final int MAX_FILES = 4;
     private static final int MAX_SEED_FILES = 4;
     private static final int MAX_CONCURRENT_SOURCE_FETCHES = 6;
     private static final int MAX_FILE_CHARS = 4000;
-    private static final int MAX_CONTEXT_CHARS = 6000;
+    private static final int MAX_CONTEXT_CHARS = 4500;
+    private static final int MAX_FILE_INDEX_CHARS = 5000;
+    private static final int MAX_CHAT_COMPLETION_TOKENS = 384;
     private static final Pattern JAVA_IMPORT = Pattern.compile(
             "(?m)^\\s*import\\s+(?:static\\s+)?([\\w.]+)(\\.\\*)?\\s*;");
     private static final Pattern PACKAGE_DECLARATION = Pattern.compile(
@@ -56,8 +63,7 @@ public class RepositoryChatService {
     private final RestClient rawGitHubClient;
     private final VectorStore vectorStore;
 
-    private static final Logger log =
-            LoggerFactory.getLogger(RepositoryChatService.class);
+    private static final Logger log = LoggerFactory.getLogger(RepositoryChatService.class);
 
     public RepositoryChatService(
             RepositoryInfoRepository repositoryInfoRepository,
@@ -67,31 +73,53 @@ public class RepositoryChatService {
         this.repositoryInfoRepository = repositoryInfoRepository;
         this.chatClient = chatClientBuilder.build();
         this.vectorStore = vectorStore;
+        SimpleClientHttpRequestFactory githubRequestFactory = new SimpleClientHttpRequestFactory();
+        githubRequestFactory.setConnectTimeout(Duration.ofSeconds(1));
+        githubRequestFactory.setReadTimeout(Duration.ofSeconds(2));
         this.githubClient = RestClient.builder()
                 .baseUrl("https://api.github.com")
                 .defaultHeader("Accept", "application/vnd.github+json")
+                .requestFactory(githubRequestFactory)
                 .build();
-        this.rawGitHubClient = RestClient.create();
+        SimpleClientHttpRequestFactory rawGitHubRequestFactory = new SimpleClientHttpRequestFactory();
+        rawGitHubRequestFactory.setConnectTimeout(Duration.ofSeconds(1));
+        rawGitHubRequestFactory.setReadTimeout(Duration.ofSeconds(2));
+        this.rawGitHubClient = RestClient.builder()
+                .requestFactory(rawGitHubRequestFactory)
+                .build();
     }
 
     public Map<String, Object> ask(Long repositoryId, String question) {
+        return ask(repositoryId, question, "");
+    }
+
+    public Map<String, Object> ask(
+            Long repositoryId,
+            String question,
+            String conversationContext) {
         long requestStartedNanos = System.nanoTime();
         if (question == null || question.isBlank()) {
             throw new IllegalArgumentException("Question is required");
         }
+        String latestQuestion = question.trim();
+        String historyContext = conversationContext == null
+                ? ""
+                : conversationContext.trim();
 
         RepositoryInfo repository = repositoryInfoRepository.findById(repositoryId)
                 .orElseThrow(() -> new IllegalArgumentException(
                         "Repository not found: " + repositoryId));
 
         long retrievalStartedNanos = System.nanoTime();
-        Map<String, Object> ragAnswer =
-                answerUsingRag(repository, repositoryId, question);
+        if (!isProjectStructureQuestion(latestQuestion)) {
+            Map<String, Object> ragAnswer = answerUsingRag(
+                    repository, repositoryId, latestQuestion, historyContext);
 
-        if (ragAnswer != null) {
-            log.info("Repository chat completed: repositoryId={}, route=rag, elapsedMs={}",
-                    repositoryId, elapsedMillis(requestStartedNanos));
-            return ragAnswer;
+            if (ragAnswer != null) {
+                log.info("Repository chat completed: repositoryId={}, route=rag, elapsedMs={}",
+                        repositoryId, elapsedMillis(requestStartedNanos));
+                return ragAnswer;
+            }
         }
         log.info("Repository chat RAG retrieval missed: repositoryId={}, retrievalMs={}",
                 repositoryId, elapsedMillis(retrievalStartedNanos));
@@ -102,18 +130,38 @@ public class RepositoryChatService {
         String branch = repository.getDefaultBranch();
         String selectedBranch = branch == null || branch.isBlank() ? "main" : branch;
 
-        JsonNode tree = githubClient.get()
-                .uri(uriBuilder -> uriBuilder
-                        .path("/repos/{owner}/{repo}/git/trees/{branch}")
-                        .queryParam("recursive", "1")
-                        .build(owner, repo, selectedBranch))
-                .retrieve()
-                .body(JsonNode.class);
+        JsonNode tree;
+        try {
+            tree = githubClient.get()
+                    .uri(uriBuilder -> uriBuilder
+                            .path("/repos/{owner}/{repo}/git/trees/{branch}")
+                            .queryParam("recursive", "1")
+                            .build(owner, repo, selectedBranch))
+                    .retrieve()
+                    .body(JsonNode.class);
+        } catch (RestClientException exception) {
+            log.warn("Could not retrieve GitHub file tree: repositoryId={}",
+                    repositoryId, exception);
+            return buildFallbackResponse(
+                    repositoryId,
+                    latestQuestion,
+                    Set.of(),
+                    "GitHub's file tree could not be retrieved.");
+        }
 
         if (tree == null || !tree.has("tree")) {
-            throw new IllegalStateException("Could not fetch the repository file tree");
+            log.warn("GitHub returned no file tree: repositoryId={}", repositoryId);
+            return buildFallbackResponse(
+                    repositoryId,
+                    latestQuestion,
+                    Set.of(),
+                    "GitHub did not provide a repository file tree.");
+        }
+        if (isProjectStructureQuestion(latestQuestion)) {
+            return answerProjectStructure(repositoryId, tree);
         }
         long treeFetchMillis = elapsedMillis(retrievalStartedNanos);
+        String repositoryFileIndex = buildRepositoryFileIndex(tree, latestQuestion);
 
         List<String> candidates = new ArrayList<>();
         for (JsonNode item : tree.path("tree")) {
@@ -123,11 +171,11 @@ public class RepositoryChatService {
             String path = item.path("path").asText();
             long size = item.path("size").asLong(0);
             if (isUsefulFile(path, size)
-                    && (questionMentionsTests(question) || !isTestPath(path))) {
+                    && (questionMentionsTests(latestQuestion) || !isTestPath(path))) {
                 candidates.add(path);
             }
         }
-        candidates.sort(Comparator.comparingInt(path -> filePriority(path, question)));
+        candidates.sort(Comparator.comparingInt(path -> filePriority(path, latestQuestion)));
 
         // Index source files by their filename so imported Java types can be resolved.
         Map<String, List<String>> pathsByClassName = new LinkedHashMap<>();
@@ -142,17 +190,6 @@ public class RepositoryChatService {
         Deque<String> pending = new ArrayDeque<>();
         Set<String> queued = new LinkedHashSet<>();
         int seedCount = 0;
-        for (String candidate : candidates) {
-            if (seedCount >= MAX_SEED_FILES) {
-                break;
-            }
-            if (isLikelySeed(candidate, question)) {
-                pending.addLast(candidate);
-                queued.add(candidate);
-                seedCount++;
-            }
-        }
-        // Ensure we still have seed files for unusual questions or repositories.
         for (String candidate : candidates) {
             if (seedCount >= MAX_SEED_FILES) {
                 break;
@@ -238,9 +275,6 @@ public class RepositoryChatService {
             }
         }
 
-        if (sources.isEmpty()) {
-            throw new IllegalStateException("Could not retrieve source files from GitHub");
-        }
         long sourceFetchMillis = elapsedMillis(retrievalStartedNanos) - treeFetchMillis;
 
         // Include explicit line numbers so the model can cite verifiable locations.
@@ -249,71 +283,69 @@ public class RepositoryChatService {
                 .append("\n\n--- FILE: ").append(path).append(" ---\n")
                 .append(formatSourceWithLineNumbers(content)));
 
-        boolean dependencyQuestion = isDependencyQuestion(question);
-        String evidenceIndex = dependencyQuestion
-                ? buildEvidenceIndex(sources)
-                : "Not needed for this question.";
-        String dependencyGraph = dependencyQuestion
-                ? buildDependencyGraph(sources)
-                : "Not needed for this question.";
-
         String systemPrompt = """
-                You are RepoInsight, a source-grounded code analysis assistant.
-                Use only the supplied source. Include citations in the format
-                `path/to/File.java:12-16` for important repository-specific claims. Do not
-                invent files, annotations, fields, constructors, or relationships. Every
-                answer must include at least one exact citation in the form
-                `src/main/java/package/Class.java:12-16`. Put the citation on the same
-                bullet or sentence as the claim. If the retrieved source does not establish
-                a point, say so explicitly and cite the closest relevant source evidence.
+                You are RepoInsight, a repository-aware assistant. Answer the user's actual
+                question using the repository metadata, file inventory, and retrieved source.
+                Use the file inventory to answer questions about whether a file or technology
+                exists and how the project is organized. Use source excerpts to explain
+                implementation behavior. Do not treat filenames alone as proof of runtime
+                behavior, and do not invent files, symbols, or behavior.
 
-                Never invent or transfer annotations, fields, constructors, or relationships
-                between classes. An import, filename, inheritance, or method name alone does
-                not prove dependency injection. `new Type()` is object construction, not
-                automatically DI. `@Autowired`, `@Inject`, and `@Resource` are injection
-                annotations. Constructor injection can be established by a constructor that
-                accepts a dependency in a Spring-managed class. A `@Bean` method establishes
-                a bean definition, but do not infer unshown wiring.
-
-                Distinguish framework annotations by what they actually mean in the source.
-                JPA mapping annotations are not dependency injection. A constructor parameter
-                is evidence of a declared dependency, but do not claim Spring wires it unless
-                the class's Spring role or configuration supports that conclusion. Do not infer
-                runtime behavior that is not established by the retrieved code.
-
-                Keep findings specific to the exact declared class and cited lines. Do not
-                use a general framework convention as evidence that an annotation exists.
-                If unsure, explicitly state that the source does not establish the claim.
-                Answer in clear, concise paragraphs or numbered steps, matching the
-                question. Do not output source code or fenced code blocks unless the user
-                explicitly asks for code. Do not describe your drafting or revision process.
+                If repository evidence is insufficient, say exactly what is missing and then
+                give clearly labeled general guidance when useful. Never present general
+                guidance as a fact about this repository. Cite the supplied source path for
+                repository-specific claims; cite line numbers only when the context provides
+                them. Be direct, specific, and concise, under 150 words.
                 """;
 
         String userPrompt = """
                 Repository: %s
                 GitHub URL: %s
+                Description: %s
+                Primary language: %s
+                Topics: %s
 
-                Deterministic Java structure extracted from retrieved files (treat this as
-                syntax-level evidence, not proof of runtime behavior):
+                Conversation history (context only; do not treat as repository evidence):
+                %s
+
+                Repository file inventory:
                 %s
 
                 Retrieved source files:
                 %s
 
-                Evidence index:
-                %s
-
                 Question:
                 %s
-                """.formatted(repository.getName(), repository.getGithubUrl(),
-                dependencyGraph, context, evidenceIndex, question);
+                """.formatted(
+                repository.getName(),
+                repository.getGithubUrl(),
+                repository.getDescription(),
+                repository.getLanguage(),
+                repository.getTopics(),
+                historyContext,
+                repositoryFileIndex,
+                context,
+                latestQuestion);
 
         long generationStartedNanos = System.nanoTime();
-        String answer = chatClient.prompt()
-                .system(systemPrompt)
-                .user(userPrompt)
-                .call()
-                .content();
+        String answer;
+        try {
+            answer = chatClient.prompt()
+                    .system(systemPrompt)
+                    .user(userPrompt)
+                    .options(OpenAiChatOptions.builder()
+                            .maxTokens(MAX_CHAT_COMPLETION_TOKENS))
+                    .call()
+                    .content();
+        } catch (RuntimeException exception) {
+            log.error("Repository chat model request failed: repositoryId={}",
+                    repositoryId, exception);
+            return buildFallbackResponse(
+                    repositoryId,
+                    latestQuestion,
+                    sources.keySet(),
+                    "The AI model request failed, so the retrieved source could not be analyzed.");
+        }
         long generationMillis = elapsedMillis(generationStartedNanos);
 
         List<String> validationErrors = validateAnswer(answer, sources);
@@ -323,7 +355,8 @@ public class RepositoryChatService {
         }
 
         if (!validationErrors.isEmpty()) {
-            // Do not discard a non-empty explanation solely because citation formatting failed.
+            // Do not discard a non-empty explanation solely because citation formatting
+            // failed.
             // The strict validator is a citation-quality check, not a reason to replace a
             // general answer with a Java-annotation evidence dump. Keep the deterministic
             // evidence fallback only for genuinely empty model responses.
@@ -332,15 +365,15 @@ public class RepositoryChatService {
             }
         }
 
-        log.info("Repository chat completed: repositoryId={}, route=github-fallback, files={}, contextChars={}, treeFetchMs={}, sourceFetchMs={}, generationMs={}, elapsedMs={}",
+        log.info(
+                "Repository chat completed: repositoryId={}, route=github-fallback, files={}, contextChars={}, treeFetchMs={}, sourceFetchMs={}, generationMs={}, elapsedMs={}",
                 repositoryId, sources.size(), context.length(), treeFetchMillis,
                 sourceFetchMillis, generationMillis, elapsedMillis(requestStartedNanos));
 
         return Map.of(
                 "repositoryId", repositoryId,
                 "answer", answer == null ? "" : answer,
-                "sources", sources.keySet()
-        );
+                "sources", sources.keySet());
     }
 
     private long elapsedMillis(long startedNanos) {
@@ -356,7 +389,8 @@ public class RepositoryChatService {
     }
 
     /**
-     * Deterministic guardrail: verifies citation paths/ranges and checks that annotation
+     * Deterministic guardrail: verifies citation paths/ranges and checks that
+     * annotation
      * names mentioned in an answer actually occur inside at least one cited range.
      * This is a grounding check, not a full Java semantic proof.
      */
@@ -395,14 +429,16 @@ public class RepositoryChatService {
         if (validCitationCount == 0) {
             errors.add("No valid source citations were found.");
         }
-        // Intentionally do not reject otherwise useful answers because a small model omitted
+        // Intentionally do not reject otherwise useful answers because a small model
+        // omitted
         // a citation on one paragraph or formatted a citation imperfectly.
         return errors.stream().distinct().limit(8).toList();
     }
 
     private void validateParagraphCitation(String paragraph, List<String> errors) {
         String trimmed = paragraph == null ? "" : paragraph.trim();
-        if (trimmed.isEmpty()) return;
+        if (trimmed.isEmpty())
+            return;
 
         boolean bulletOrNumbered = trimmed.startsWith("- ")
                 || trimmed.startsWith("* ")
@@ -524,12 +560,12 @@ public class RepositoryChatService {
             String rawUrl = "https://raw.githubusercontent.com/" + owner + "/" + repo
                     + "/" + branch + "/" + path;
             return rawGitHubClient.get().uri(rawUrl).retrieve().body(String.class);
-        } catch (Exception exception) {
-            // Skip inaccessible files; continue building the available context.
+        } catch (RestClientException exception) {
+            log.warn("Could not retrieve GitHub source file: repository={}, path={}",
+                    owner + "/" + repo, path, exception);
             return null;
         }
     }
-
 
     private void enqueueClassPaths(
             String className,
@@ -537,10 +573,13 @@ public class RepositoryChatService {
             Set<String> queued,
             Deque<String> pending) {
         List<String> matchingPaths = pathsByClassName.get(className);
-        if (matchingPaths == null) return;
+        if (matchingPaths == null)
+            return;
         for (String dependencyPath : matchingPaths) {
-            if (queued.size() >= MAX_FILES) break;
-            if (queued.add(dependencyPath)) pending.addLast(dependencyPath);
+            if (queued.size() >= MAX_FILES)
+                break;
+            if (queued.add(dependencyPath))
+                pending.addLast(dependencyPath);
         }
     }
 
@@ -556,7 +595,8 @@ public class RepositoryChatService {
             Matcher constructorMatcher = constructorPattern.matcher(source);
             while (constructorMatcher.find()) {
                 String parameters = constructorMatcher.group(1).trim();
-                if (parameters.isEmpty()) continue;
+                if (parameters.isEmpty())
+                    continue;
                 for (String parameter : parameters.split(",")) {
                     String cleaned = parameter
                             .replaceAll("@\\w+(?:\\([^)]*\\))?\\s*", "")
@@ -568,8 +608,10 @@ public class RepositoryChatService {
                                 .replaceAll("<.*>", "")
                                 .replaceAll("\\[\\]", "");
                         int dot = type.lastIndexOf('.');
-                        if (dot >= 0) type = type.substring(dot + 1);
-                        if (type.matches("[A-Z_$][A-Za-z0-9_$]*")) types.add(type);
+                        if (dot >= 0)
+                            type = type.substring(dot + 1);
+                        if (type.matches("[A-Z_$][A-Za-z0-9_$]*"))
+                            types.add(type);
                     }
                 }
             }
@@ -595,7 +637,8 @@ public class RepositoryChatService {
 
             int lastDot = importedName.lastIndexOf('.');
             String simpleName = lastDot >= 0
-                    ? importedName.substring(lastDot + 1) : importedName;
+                    ? importedName.substring(lastDot + 1)
+                    : importedName;
             if (!simpleName.isBlank()) {
                 names.add(simpleName);
             }
@@ -699,28 +742,6 @@ public class RepositoryChatService {
         return path.substring(slash + 1, dot > slash ? dot : path.length());
     }
 
-    private boolean isLikelySeed(String path, String question) {
-        String lower = path.toLowerCase(Locale.ROOT);
-        String q = question.toLowerCase(Locale.ROOT);
-        boolean tests = questionMentionsTests(question);
-        boolean dependencyQuestion = q.contains("dependency") || q.contains("inject")
-                || q.contains("bean") || q.contains("autowired") || q.contains("wiring")
-                || q.contains("spring") || q.contains("annotation");
-        boolean flowQuestion = q.contains("request flow") || q.contains("controller")
-                || q.contains("endpoint") || q.contains("request") || q.contains("trace")
-                || q.contains("api flow") || q.contains("call flow");
-
-        if (!tests && isTestPath(path)) return false;
-        if (!lower.endsWith(".java")) return false;
-        if (dependencyQuestion || flowQuestion) {
-            return lower.contains("controller") || lower.contains("service")
-                    || lower.contains("repository") || lower.contains("/dao/")
-                    || lower.contains("/config") || lower.contains("configuration")
-                    || lower.contains("application.java");
-        }
-        return true;
-    }
-
     private boolean isTestPath(String path) {
         String lower = path.toLowerCase(Locale.ROOT);
         return lower.startsWith("src/test/") || lower.contains("/src/test/")
@@ -736,7 +757,8 @@ public class RepositoryChatService {
 
     /**
      * Builds a compact, deterministic syntax summary. It only reports relationships
-     * directly visible in the retrieved Java source; it is not a complete Spring bean graph.
+     * directly visible in the retrieved Java source; it is not a complete Spring
+     * bean graph.
      */
     private String buildDependencyGraph(Map<String, String> sources) {
         StringBuilder graph = new StringBuilder();
@@ -745,14 +767,17 @@ public class RepositoryChatService {
                 "@(?:RestController|Controller|Service|Component|Repository|Configuration|SpringBootApplication)\\b");
         for (Map.Entry<String, String> entry : sources.entrySet()) {
             String path = entry.getKey();
-            if (!path.endsWith(".java") || isTestPath(path)) continue;
+            if (!path.endsWith(".java") || isTestPath(path))
+                continue;
             String src = entry.getValue();
             Matcher typeMatcher = typePattern.matcher(src);
-            if (!typeMatcher.find()) continue;
+            if (!typeMatcher.find())
+                continue;
             String className = typeMatcher.group(2);
             Matcher stereotypeMatcher = stereotypePattern.matcher(src);
             String stereotype = stereotypeMatcher.find()
-                    ? stereotypeMatcher.group().substring(1) : null;
+                    ? stereotypeMatcher.group().substring(1)
+                    : null;
             if (stereotype != null) {
                 graph.append(className).append(" [@").append(stereotype).append("]");
             } else {
@@ -805,35 +830,113 @@ public class RepositoryChatService {
                 || lower.endsWith(".md") || lower.endsWith(".xml")
                 || lower.endsWith(".yml") || lower.endsWith(".yaml")
                 || lower.endsWith(".properties") || lower.endsWith(".gradle")
-                || lower.endsWith(".json");
+                || lower.endsWith(".json") || lower.endsWith(".css")
+                || lower.endsWith(".scss") || lower.endsWith(".sass")
+                || lower.endsWith(".less") || lower.endsWith(".html")
+                || lower.endsWith(".htm") || lower.endsWith(".vue")
+                || lower.endsWith(".svelte") || lower.endsWith(".mdx")
+                || lower.endsWith(".sql") || lower.endsWith(".sh")
+                || lower.endsWith(".toml") || lower.endsWith(".ini")
+                || lower.endsWith(".conf") || lower.endsWith(".gradle.kts")
+                || lower.endsWith(".dockerfile") || lower.endsWith(".gitignore");
     }
 
     private int filePriority(String path, String question) {
         String lower = path.toLowerCase(Locale.ROOT);
-        String q = question.toLowerCase(Locale.ROOT);
-        boolean tests = questionMentionsTests(question);
-        boolean dependencyQuestion = q.contains("dependency") || q.contains("inject")
-                || q.contains("bean") || q.contains("autowired") || q.contains("wiring")
-                || q.contains("spring") || q.contains("annotation");
-        boolean flowQuestion = q.contains("request flow") || q.contains("controller")
-                || q.contains("endpoint") || q.contains("request") || q.contains("trace")
-                || q.contains("api flow") || q.contains("call flow");
-        int score = lower.endsWith(".java") ? 20 : 60;
-        if (isTestPath(path)) score += tests ? -10 : 1000;
-        if (dependencyQuestion || flowQuestion) {
-            if (lower.contains("controller")) score -= 18;
-            if (lower.contains("service")) score -= 14;
-            if (lower.contains("repository") || lower.contains("/dao/")) score -= 12;
-            if (lower.contains("config") || lower.contains("configuration")) score -= 5;
-            if (lower.contains("application.java")) score -= 3;
-            if (lower.contains("/model/") || lower.contains("/entity/")) score += 8;
+        int priority = -pathQuestionScore(path, question) * 10;
+        String fileName = lower.substring(lower.lastIndexOf('/') + 1);
+        if (fileName.matches("readme(?:\\.[a-z0-9]+)?")) {
+            priority -= 8;
         }
-        if (q.contains("configuration") || q.contains("database") || q.contains("deployment")) {
-            if (lower.endsWith(".yml") || lower.endsWith(".yaml")
-                    || lower.endsWith(".properties") || lower.endsWith(".xml")
-                    || lower.endsWith(".gradle") || lower.endsWith("dockerfile")) score -= 15;
+        if (isTestPath(path) && !questionMentionsTests(question)) {
+            priority += 1000;
+        }
+        return priority;
+    }
+
+    private static int pathQuestionScore(String path, String question) {
+        Set<String> terms = questionTerms(question);
+        String lowerPath = path.toLowerCase(Locale.ROOT);
+        String fileName = lowerPath.substring(lowerPath.lastIndexOf('/') + 1);
+        int score = 0;
+        for (String term : terms) {
+            if (fileName.contains(term)) {
+                score += 3;
+            } else if (lowerPath.contains(term)) {
+                score++;
+            }
         }
         return score;
+    }
+
+    private static Set<String> questionTerms(String question) {
+        Set<String> stopWords = Set.of(
+                "the", "a", "an", "and", "or", "in", "on", "to", "of", "for",
+                "is", "are", "does", "do", "how", "what", "which", "this",
+                "that", "it", "its", "with", "from", "using", "please", "file",
+                "files", "repository", "repo", "project", "code", "codebase",
+                "have", "has", "any", "show", "tell", "me", "about");
+        Set<String> terms = new LinkedHashSet<>();
+        for (String token : question.toLowerCase(Locale.ROOT).split("[^a-z0-9]+")) {
+            if (token.length() > 1 && !stopWords.contains(token)) {
+                terms.add(token);
+            }
+        }
+        return terms;
+    }
+
+    private String buildRepositoryFileIndex(JsonNode tree, String question) {
+        List<String> paths = new ArrayList<>();
+        for (JsonNode item : tree.path("tree")) {
+            if ("blob".equals(item.path("type").asText())) {
+                paths.add(item.path("path").asText());
+            }
+        }
+        return buildRepositoryFileIndex(paths, question);
+    }
+
+    static String buildRepositoryFileIndex(List<String> paths, String question) {
+        Map<String, Integer> directories = new TreeMap<>();
+        Map<String, Integer> extensions = new TreeMap<>();
+        for (String path : paths) {
+            int slash = path.indexOf('/');
+            if (slash >= 0) {
+                directories.merge(path.substring(0, slash), 1, Integer::sum);
+            }
+            int dot = path.lastIndexOf('.');
+            if (dot >= 0 && dot > path.lastIndexOf('/')) {
+                extensions.merge(path.substring(dot).toLowerCase(Locale.ROOT), 1, Integer::sum);
+            } else {
+                extensions.merge("[no extension]", 1, Integer::sum);
+            }
+        }
+
+        StringBuilder index = new StringBuilder("Total files: ")
+                .append(paths.size()).append("\nTop-level directories: ");
+        directories.entrySet().stream()
+                .sorted(Map.Entry.<String, Integer>comparingByValue().reversed()
+                        .thenComparing(Map.Entry.comparingByKey()))
+                .limit(25)
+                .forEach(entry -> index.append(entry.getKey())
+                        .append("/ (").append(entry.getValue()).append("), "));
+        index.append("\nFile types: ");
+        extensions.forEach((extension, count) -> index.append(extension)
+                .append(" (").append(count).append("), "));
+
+        List<String> rankedPaths = new ArrayList<>(paths);
+        rankedPaths.sort(Comparator
+                .comparingInt((String path) -> pathQuestionScore(path, question))
+                .reversed()
+                .thenComparing(String::compareToIgnoreCase));
+        index.append("\nPaths (question matches first):\n");
+        for (String path : rankedPaths) {
+            if (index.length() + path.length() + 1 > MAX_FILE_INDEX_CHARS) {
+                index.append("... remaining paths omitted; counts above include the full tree.");
+                break;
+            }
+            index.append(path).append('\n');
+        }
+        return index.toString();
     }
 
     private String[] parseGitHubUrl(String githubUrl) {
@@ -846,139 +949,476 @@ public class RepositoryChatService {
         if (parts.length < 2) {
             throw new IllegalArgumentException("Invalid GitHub repository URL");
         }
-        return new String[]{parts[0], parts[1].replaceFirst("\\.git$", "")};
+        return new String[] { parts[0], parts[1].replaceFirst("\\.git$", "") };
     }
 
     private Map<String, Object> answerUsingRag(
             RepositoryInfo repository,
             Long repositoryId,
-            String question) {
+            String question,
+            String conversationContext) {
 
-        // Retrieve a wider candidate set, then rerank it before sending to the LLM.
         long retrievalStartedNanos = System.nanoTime();
-        List<Document> matches = vectorStore.similaritySearch(
-                SearchRequest.builder()
-                        .query(question)
-                        .topK(12)
-                        .filterExpression("repositoryId == " + repositoryId)
-                        .build());
+
+        List<Document> matches;
+        try {
+            matches = vectorStore.similaritySearch(
+                    SearchRequest.builder()
+                            .query(question)
+                            .topK(20)
+                            .filterExpression("repositoryId == " + repositoryId)
+                            .build());
+        } catch (RuntimeException exception) {
+            log.warn("RAG search failed: repositoryId={}", repositoryId, exception);
+            return null;
+        }
 
         if (matches == null || matches.isEmpty()) {
-            log.info("Repository chat vector retrieval returned no matches: repositoryId={}, elapsedMs={}",
-                    repositoryId, elapsedMillis(retrievalStartedNanos));
-            return null;
-        }
-        boolean quickIndex = matches.stream().anyMatch(document ->
-                "quick".equals(document.getMetadata().get("indexScope")));
-        int bestKeywordScore = matches.stream()
-                .mapToInt(document -> scoreChunk(document, question))
-                .max()
-                .orElse(0);
-        if (quickIndex && bestKeywordScore < 8) {
-            log.info("Repository chat quick-index relevance was low: repositoryId={}, bestScore={}, elapsedMs={}",
-                    repositoryId, bestKeywordScore,
-                    elapsedMillis(retrievalStartedNanos));
             return null;
         }
 
-        // Rank chunks using both the question and the retrieved source code.
-        List<Document> rankedMatches = new ArrayList<>(matches);
-        rankedMatches.sort(
+        List<Document> ranked = new ArrayList<>(matches);
+        ranked.sort(
                 Comparator.comparingInt(
-                                (Document document) -> scoreChunk(document, question))
+                        (Document d) -> scoreChunk(d, question))
                         .reversed());
 
-        // Keep the final context small and relevant.
-        List<Document> selected = rankedMatches.stream()
-                .limit(4)
-                .toList();
-
-        StringBuilder context = new StringBuilder();
+        Set<String> seenChunks = new LinkedHashSet<>();
+        List<Document> selected = new ArrayList<>();
         Set<String> sourcePaths = new LinkedHashSet<>();
+        StringBuilder context = new StringBuilder();
 
-        for (Document document : selected) {
+        for (Document document : ranked) {
+            String content = document.getText();
+            if (content == null || content.isBlank()) {
+                continue;
+            }
+
+            String normalized = content.trim();
+            if (!seenChunks.add(normalized)) {
+                continue;
+            }
+
+            int score = scoreChunk(document, question);
+
+            // Avoid generating an answer from semantically weak candidates.
+            if (score < 3 && selected.isEmpty()) {
+                continue;
+            }
+
             Object pathValue = document.getMetadata().get("filePath");
             String path = pathValue == null
                     ? "Unknown source file"
                     : pathValue.toString();
 
-            sourcePaths.add(path);
+            int remaining = 6500 - context.length();
+            if (remaining <= 0 || selected.size() >= 6) {
+                break;
+            }
+
+            if (content.length() > remaining) {
+                content = content.substring(0, remaining);
+            }
 
             context.append("\n\n--- FILE: ")
                     .append(path)
                     .append(" ---\n")
-                    .append(document.getText())
-                    .append("\n");
+                    .append(content);
+
+            selected.add(document);
+            sourcePaths.add(path);
+        }
+
+        if (selected.isEmpty()) {
+            return null;
         }
 
         String systemPrompt = """
-            You are RepoInsight, a precise repository code analysis assistant.
+                You are RepoInsight, a repository code analysis assistant.
 
-            Answer repository-specific questions using only the retrieved code.
-            Never invent classes, methods, endpoints, annotations, or behavior.
-            Write a direct, readable answer in concise paragraphs or numbered
-            steps that match the question. Do not output code blocks unless the
-            user explicitly asks for code. Do not mention drafting or revision.
+                Answer repository-specific questions using only the supplied code.
+                Do not invent classes, methods, endpoints, annotations, or behavior.
+                A filename or import alone does not prove runtime behavior.
+                If the supplied code does not establish the answer, say so explicitly.
+                Do not present general framework conventions as facts about this
+                repository.
 
-            RETRIEVAL RULES:
-            - Retrieved chunks are candidates, not automatically correct evidence.
-            - Select evidence that directly answers the user's question.
-            - Do not treat code that merely mentions a class or application as
-              proof that it handles HTTP requests.
-            - For HTTP request handling, look for direct evidence such as
-              @RestController, @Controller, @RequestMapping, @GetMapping,
-              @PostMapping, or equivalent framework-specific route definitions.
-            - Distinguish application startup, build plugins, business services,
-              repositories, and HTTP controllers.
-            - If no supplied chunk establishes the answer, say that the available
-              retrieved code is insufficient to identify it.
-            - Do not infer that a class exists merely because it is common in
-              Spring Boot applications.
+                Cite important claims using the exact source path and line numbers
+                only when those line numbers are supplied in the source context.
+                If line numbers are unavailable, cite the source filename without
+                inventing a line range.
 
-            ANSWER FORMAT:
-            - Answer directly in concise, readable paragraphs or numbered steps,
-              matching the question.
-            - Do not output source code or fenced code blocks unless explicitly asked.
-            - Do not describe your drafting or revision process.
-            - Name the relevant source file for each important claim.
-            - Explain what the retrieved code actually demonstrates.
-            - Explicitly mention uncertainty when the evidence is incomplete.
-            - Use source file paths in the prose when they support an important claim.
-            """;
+                Conversation history is only context for resolving references.
+                Do not repeat it or treat prior assistant statements as repository facts.
+                Be concise, answer the exact question, and state uncertainty when
+                evidence is incomplete. Keep the answer under 150 words.
+                """;
 
         String userPrompt = """
-            Repository: %s
-            GitHub URL: %s
+                Repository: %s
+                GitHub URL: %s
 
-            Retrieved code, ranked for this question:
-            %s
+                Conversation history (context only):
+                %s
 
-            Question:
-            %s
-            """.formatted(
+                Retrieved source code:
+                %s
+
+                Question:
+                %s
+                """.formatted(
                 repository.getName(),
                 repository.getGithubUrl(),
+                conversationContext,
                 context,
                 question);
 
         long generationStartedNanos = System.nanoTime();
-        String answer = chatClient.prompt()
-                .system(systemPrompt)
-                .user(userPrompt)
-                .call()
-                .content();
-        log.info("Repository chat RAG answered: repositoryId={}, matches={}, contextChars={}, retrievalMs={}, generationMs={}",
-                repositoryId, selected.size(), context.length(),
-                elapsedMillis(retrievalStartedNanos),
-                elapsedMillis(generationStartedNanos));
+
+        String answer;
+        try {
+            answer = chatClient.prompt()
+                    .system(systemPrompt)
+                    .user(userPrompt)
+                    .options(OpenAiChatOptions.builder()
+                            .maxTokens(MAX_CHAT_COMPLETION_TOKENS))
+                    .call()
+                    .content();
+        } catch (RuntimeException exception) {
+            log.warn("RAG generation failed: repositoryId={}",
+                    repositoryId, exception);
+            return buildFallbackResponse(
+                    repositoryId,
+                    question,
+                    sourcePaths,
+                    "The AI model did not respond within the configured timeout.");
+        }
+
+        if (answer == null || answer.isBlank()) {
+            log.warn("RAG generation returned an empty answer: repositoryId={}",
+                    repositoryId);
+            return buildFallbackResponse(
+                    repositoryId,
+                    question,
+                    sourcePaths,
+                    "The AI model returned an empty answer.");
+        }
 
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("repositoryId", repositoryId);
-        response.put("answer", answer == null ? "" : answer);
+        response.put("answer", answer.trim());
         response.put("sources", sourcePaths);
         response.put("retrieval", "RAG");
 
+        log.info(
+                "RAG completed: repositoryId={}, candidates={}, selected={}, "
+                        + "retrievalMs={}, generationMs={}",
+                repositoryId,
+                matches.size(),
+                selected.size(),
+                (generationStartedNanos - retrievalStartedNanos) / 1_000_000,
+                elapsedMillis(generationStartedNanos));
+
         return response;
+    }
+
+    private Map<String, Object> buildFallbackResponse(
+            Long repositoryId,
+            String question,
+            Set<String> sources,
+            String limitation) {
+        StringBuilder answer = new StringBuilder(
+                "I couldn't complete the repository analysis for the question: \"")
+                .append(question)
+                .append("\". ")
+                .append(limitation);
+        if (sources.isEmpty()) {
+            answer.append(" No source files were available to verify an answer.");
+        } else {
+            answer.append(" Retrieved source files: ")
+                    .append(String.join(", ", sources))
+                    .append('.');
+        }
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("repositoryId", repositoryId);
+        response.put("answer", answer.toString());
+        response.put("sources", sources);
+        response.put("retrieval", "REPOSITORY_EVIDENCE_FALLBACK");
+        return response;
+    }
+
+    private boolean isRepositoryImplementationQuestion(String question) {
+        String lowerQuestion = question.toLowerCase(Locale.ROOT);
+        return lowerQuestion.contains("in this repository")
+                || lowerQuestion.contains("in this repo")
+                || lowerQuestion.contains("in this project")
+                || lowerQuestion.contains("in the codebase")
+                || lowerQuestion.contains("in our code")
+                || lowerQuestion.contains("where is ")
+                || lowerQuestion.contains("where are ")
+                || lowerQuestion.contains("where does ")
+                || lowerQuestion.contains("which file")
+                || lowerQuestion.contains("implemented in")
+                || lowerQuestion.contains("how is ")
+                        && (lowerQuestion.contains("handled")
+                                || lowerQuestion.contains("implemented"));
+    }
+
+    private boolean isAuthenticationQuestion(String lowerQuestion) {
+        return lowerQuestion.contains("authentication")
+                || lowerQuestion.contains("authenticate")
+                || lowerQuestion.contains("authorization")
+                || lowerQuestion.contains("authorisation")
+                || lowerQuestion.contains("jwt")
+                || lowerQuestion.contains("login")
+                || lowerQuestion.contains("log in")
+                || lowerQuestion.contains("sign in")
+                || lowerQuestion.contains("security")
+                || lowerQuestion.contains("password")
+                || lowerQuestion.contains("access control")
+                || lowerQuestion.contains("permissions")
+                || lowerQuestion.contains("roles");
+    }
+
+    private boolean isProjectStructureQuestion(String question) {
+        String lowerQuestion = question.toLowerCase(Locale.ROOT);
+        return lowerQuestion.contains("project structure")
+                || lowerQuestion.contains("repository structure")
+                || lowerQuestion.contains("repo structure")
+                || lowerQuestion.contains("codebase structure")
+                || lowerQuestion.contains("folder structure")
+                || lowerQuestion.contains("directory structure")
+                || lowerQuestion.contains("how is this project organized")
+                || lowerQuestion.contains("how is the project organized");
+    }
+
+    static boolean isRepositoryOverviewQuestion(String question) {
+        String lowerQuestion = question.toLowerCase(Locale.ROOT);
+        return lowerQuestion.contains("what does this repository do")
+                || lowerQuestion.contains("what does this repo do")
+                || lowerQuestion.contains("what does this project do")
+                || lowerQuestion.contains("what is this repository")
+                || lowerQuestion.contains("what is this repo")
+                || lowerQuestion.contains("what is this project for")
+                || lowerQuestion.contains("what is the purpose of this repository")
+                || lowerQuestion.contains("what is the purpose of this repo")
+                || lowerQuestion.contains("describe this repository")
+                || lowerQuestion.contains("describe this repo")
+                || lowerQuestion.contains("summarize this repository")
+                || lowerQuestion.contains("summarize this repo")
+                || lowerQuestion.contains("repository overview")
+                || lowerQuestion.contains("repo overview");
+    }
+
+    private Map<String, Object> answerRepositoryOverview(
+            Long repositoryId,
+            RepositoryInfo repository) {
+        long startedNanos = System.nanoTime();
+        String description = repository.getDescription();
+        String readmePath = null;
+        String readmeSummary = null;
+
+        try {
+            String[] parts = parseGitHubUrl(repository.getGithubUrl());
+            String branch = repository.getDefaultBranch();
+            String selectedBranch = branch == null || branch.isBlank() ? "main" : branch;
+            JsonNode tree = githubClient.get()
+                    .uri(uriBuilder -> uriBuilder
+                            .path("/repos/{owner}/{repo}/git/trees/{branch}")
+                            .queryParam("recursive", "1")
+                            .build(parts[0], parts[1], selectedBranch))
+                    .retrieve()
+                    .body(JsonNode.class);
+
+            if (tree != null && tree.has("tree")) {
+                readmePath = findReadmePath(tree);
+                if (readmePath != null) {
+                    String readme = fetchSource(
+                            parts[0], parts[1], selectedBranch, readmePath);
+                    readmeSummary = extractReadmeSummary(readme);
+                }
+            }
+        } catch (RestClientException | IllegalArgumentException exception) {
+            log.warn("Could not retrieve repository overview from GitHub: repositoryId={}",
+                    repositoryId, exception);
+        }
+
+        StringBuilder answer = new StringBuilder();
+        if (description != null && !description.isBlank()) {
+            answer.append(description.trim());
+        }
+        if (readmeSummary != null && !readmeSummary.isBlank()
+                && !readmeSummary.equalsIgnoreCase(description == null ? "" : description.trim())) {
+            if (!answer.isEmpty()) {
+                answer.append("\n\n");
+            }
+            answer.append(readmeSummary);
+        }
+        if (answer.isEmpty()) {
+            answer.append("I couldn't retrieve a repository description or README overview for ")
+                    .append(repository.getName() == null ? "this repository" : repository.getName())
+                    .append(". The repository-specific purpose can't be confirmed from the available metadata.");
+        }
+
+        if (repository.getLanguage() != null && !repository.getLanguage().isBlank()) {
+            answer.append("\n\nPrimary language: ").append(repository.getLanguage()).append('.');
+        }
+        if (repository.getTopics() != null && !repository.getTopics().isBlank()) {
+            answer.append("\nTopics: ").append(repository.getTopics()).append('.');
+        }
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("repositoryId", repositoryId);
+        response.put("answer", answer.toString());
+        response.put("sources", readmePath == null ? Set.of() : Set.of(readmePath));
+        response.put("retrieval", "REPOSITORY_OVERVIEW");
+        log.info("Repository chat completed: repositoryId={}, route=repository-overview, readmeFound={}, elapsedMs={}",
+                repositoryId, readmePath != null, elapsedMillis(startedNanos));
+        return response;
+    }
+
+    private String findReadmePath(JsonNode tree) {
+        return streamTreeFiles(tree)
+                .filter(path -> path.substring(path.lastIndexOf('/') + 1)
+                        .toLowerCase(Locale.ROOT).matches("readme(?:\\.[a-z0-9]+)?"))
+                .min(Comparator.comparingInt((String path) -> path.split("/").length)
+                        .thenComparing(String::compareToIgnoreCase))
+                .orElse(null);
+    }
+
+    private java.util.stream.Stream<String> streamTreeFiles(JsonNode tree) {
+        List<String> paths = new ArrayList<>();
+        for (JsonNode item : tree.path("tree")) {
+            if ("blob".equals(item.path("type").asText())) {
+                paths.add(item.path("path").asText());
+            }
+        }
+        return paths.stream();
+    }
+
+    static String extractReadmeSummary(String readme) {
+        if (readme == null || readme.isBlank()) {
+            return "";
+        }
+
+        List<String> paragraphs = new ArrayList<>();
+        StringBuilder paragraph = new StringBuilder();
+        for (String line : readme.split("\\R")) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) {
+                addReadmeParagraph(paragraphs, paragraph);
+                continue;
+            }
+            if (trimmed.startsWith("#")
+                    || trimmed.startsWith("<")
+                    || trimmed.matches("\\[!?\\[.*")
+                    || trimmed.matches("!?\\[.*]\\(.*\\)")
+                    || trimmed.startsWith("<!--")) {
+                addReadmeParagraph(paragraphs, paragraph);
+                continue;
+            }
+            if (!paragraph.isEmpty()) {
+                paragraph.append(' ');
+            }
+            paragraph.append(trimmed);
+        }
+        addReadmeParagraph(paragraphs, paragraph);
+
+        String summary = paragraphs.stream()
+                .filter(text -> text.length() >= 40)
+                .findFirst()
+                .orElseGet(() -> paragraphs.stream().findFirst().orElse(""));
+        if (summary.length() > 1000) {
+            int end = summary.lastIndexOf(' ', 1000);
+            summary = summary.substring(0, end > 0 ? end : 1000) + "...";
+        }
+        return summary;
+    }
+
+    private static void addReadmeParagraph(
+            List<String> paragraphs,
+            StringBuilder paragraph) {
+        if (!paragraph.isEmpty()) {
+            String text = paragraph.toString()
+                    .replaceAll("!\\[([^]]*)]\\([^)]*\\)", "$1")
+                    .replaceAll("\\[([^]]+)]\\([^)]*\\)", "$1")
+                    .replaceAll("[*_`]", "")
+                    .trim();
+            if (!text.isBlank()) {
+                paragraphs.add(text);
+            }
+            paragraph.setLength(0);
+        }
+    }
+
+    private Map<String, Object> answerProjectStructure(
+            Long repositoryId,
+            JsonNode tree) {
+        long startedNanos = System.nanoTime();
+        List<String> paths = new ArrayList<>();
+        for (JsonNode item : tree.path("tree")) {
+            if ("blob".equals(item.path("type").asText())) {
+                paths.add(item.path("path").asText());
+            }
+        }
+        String answer = buildProjectStructureSummary(paths);
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("repositoryId", repositoryId);
+        response.put("answer", answer);
+        response.put("sources", Set.of());
+        response.put("retrieval", "GITHUB_TREE");
+        log.info("Repository chat completed: repositoryId={}, route=github-tree-structure, elapsedMs={}",
+                repositoryId, elapsedMillis(startedNanos));
+        return response;
+    }
+
+    static String buildProjectStructureSummary(List<String> paths) {
+        Map<String, Integer> filesByTopLevelDirectory = new TreeMap<>();
+        List<String> rootFiles = new ArrayList<>();
+
+        for (String path : paths) {
+            int slash = path.indexOf('/');
+            if (slash < 0) {
+                rootFiles.add(path);
+            } else {
+                filesByTopLevelDirectory.merge(path.substring(0, slash), 1, Integer::sum);
+            }
+        }
+
+        StringBuilder answer = new StringBuilder(
+                "The repository's project structure is organized around these top-level areas:");
+        filesByTopLevelDirectory.entrySet().stream()
+                .sorted(Map.Entry.<String, Integer>comparingByValue().reversed()
+                        .thenComparing(Map.Entry.comparingByKey()))
+                .limit(10)
+                .forEach(entry -> answer.append("\n- `")
+                        .append(entry.getKey())
+                        .append("/` — ")
+                        .append(entry.getValue())
+                        .append(entry.getValue() == 1 ? " file" : " files")
+                        .append(" in the GitHub file tree."));
+
+        List<String> keyRootFiles = rootFiles.stream()
+                .filter(path -> path.equalsIgnoreCase("README.md")
+                        || path.equalsIgnoreCase("pom.xml")
+                        || path.equalsIgnoreCase("build.gradle")
+                        || path.equalsIgnoreCase("build.gradle.kts")
+                        || path.equalsIgnoreCase("package.json")
+                        || path.equalsIgnoreCase("pyproject.toml")
+                        || path.equalsIgnoreCase("go.mod")
+                        || path.equalsIgnoreCase("Cargo.toml"))
+                .sorted()
+                .toList();
+        if (!keyRootFiles.isEmpty()) {
+            answer.append("\n\nKey root files: ")
+                    .append(String.join(", ", keyRootFiles))
+                    .append('.');
+        }
+        answer.append(
+                "\n\nThis overview is based on the GitHub file tree; ask about a specific folder or module for more detail.");
+        return answer.toString();
     }
 
     private int scoreChunk(Document document, String question) {
@@ -991,24 +1431,8 @@ public class RepositoryChatService {
                 ? ""
                 : pathValue.toString().toLowerCase(Locale.ROOT);
 
-        String q = question.toLowerCase(Locale.ROOT);
         int score = 0;
-
-        // Reward overlap between meaningful question terms and the chunk.
-        Set<String> stopWords = Set.of(
-                "the", "a", "an", "and", "or", "in", "on", "to", "of",
-                "for", "is", "are", "does", "do", "how", "what", "which",
-                "this", "that", "it", "its", "with", "from", "using",
-                "explain", "identify", "find", "main", "each");
-
-        Set<String> questionTerms = new LinkedHashSet<>();
-        for (String token : q.split("[^a-z0-9_]+")) {
-            if (token.length() > 2 && !stopWords.contains(token)) {
-                questionTerms.add(token);
-            }
-        }
-
-        for (String term : questionTerms) {
+        for (String term : questionTerms(question)) {
             if (path.contains(term)) {
                 score += 5;
             }
@@ -1016,56 +1440,6 @@ public class RepositoryChatService {
                 score += 2;
             }
         }
-
-        // Intent-specific ranking for HTTP endpoint/controller questions.
-        boolean httpQuestion = q.contains("http")
-                || q.contains("request")
-                || q.contains("endpoint")
-                || q.contains("controller")
-                || q.contains("route");
-
-        if (httpQuestion) {
-            if (path.contains("controller")) score += 15;
-            if (path.contains("resource")) score += 3;
-
-            if (text.contains("@restcontroller")) score += 20;
-            if (text.contains("@controller")) score += 15;
-            if (text.contains("@requestmapping")) score += 12;
-            if (text.contains("@getmapping")
-                    || text.contains("@postmapping")
-                    || text.contains("@putmapping")
-                    || text.contains("@deletemapping")
-                    || text.contains("@patchmapping")) {
-                score += 12;
-            }
-
-            // Avoid confusing build tooling with application request handling.
-            if (path.contains("build-plugin/")
-                    || path.contains("/gradle/")
-                    || path.contains("findmainclass")) {
-                score -= 15;
-            }
-        }
-
-        // Small boosts for other common repository questions.
-        if (q.contains("dependency injection")
-                || q.contains("bean wiring")
-                || q.contains("autowired")) {
-            if (text.contains("@autowired")
-                    || text.contains("@inject")
-                    || text.contains("@resource")) {
-                score += 12;
-            }
-            if (path.contains("config")) score += 5;
-        }
-
-        if (q.contains("database") || q.contains("query")) {
-            if (path.contains("repository") || path.contains("/dao/")) {
-                score += 10;
-            }
-            if (text.contains("@query")) score += 8;
-        }
-
         return score;
     }
 

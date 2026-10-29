@@ -35,11 +35,12 @@ import java.util.concurrent.Executors;
 public class RepositoryIndexService {
 
     private static final Logger log = LoggerFactory.getLogger(RepositoryIndexService.class);
-    private static final int MAX_CHUNK_CHARS = 300;
-    private static final int CHUNK_OVERLAP_CHARS = 50;
-    private static final int MAX_QUICK_INDEX_CHUNKS = 24;
     private static final int MAX_DOCUMENTS_PER_BATCH = 8;
     private static final int MAX_CONCURRENT_DOWNLOADS = 8;
+    private static final int MAX_CHUNK_CHARS = 800;
+    private static final int CHUNK_OVERLAP_CHARS = 120;
+    private static final int MAX_QUICK_INDEX_CHUNKS = 24;
+
     private static final Set<String> EXCLUDED_PATH_SEGMENTS = Set.of(
             ".git",
             ".gradle",
@@ -78,8 +79,7 @@ public class RepositoryIndexService {
                 .baseUrl("https://api.github.com")
                 .defaultHeader("Accept", "application/vnd.github+json")
                 .build();
-        SimpleClientHttpRequestFactory rawContentRequestFactory =
-                new SimpleClientHttpRequestFactory();
+        SimpleClientHttpRequestFactory rawContentRequestFactory = new SimpleClientHttpRequestFactory();
         rawContentRequestFactory.setConnectTimeout(Duration.ofSeconds(10));
         rawContentRequestFactory.setReadTimeout(Duration.ofSeconds(30));
         this.rawContentClient = RestClient.builder()
@@ -88,10 +88,8 @@ public class RepositoryIndexService {
     }
 
     public Long findSmallestAvailableId() {
-        List<RepositoryInfo> repositories =
-                repositoryInfoRepository.findAll(
-                        org.springframework.data.domain.Sort.by("id")
-                );
+        List<RepositoryInfo> repositories = repositoryInfoRepository.findAll(
+                org.springframework.data.domain.Sort.by("id"));
 
         long expectedId = 1;
 
@@ -111,9 +109,8 @@ public class RepositoryIndexService {
     public void prepareIndexing(Long repositoryId) {
         RepositoryInfo repository = repositoryInfoRepository
                 .findById(repositoryId)
-                .orElseThrow(() ->
-                        new IllegalArgumentException("Repository not found: "
-                                + repositoryId));
+                .orElseThrow(() -> new IllegalArgumentException("Repository not found: "
+                        + repositoryId));
 
         updateStatus(
                 repository,
@@ -135,7 +132,8 @@ public class RepositoryIndexService {
                         repository,
                         "FAILED",
                         repository.getIndexingProgress() == null
-                                ? 0 : repository.getIndexingProgress(),
+                                ? 0
+                                : repository.getIndexingProgress(),
                         repository.getIndexedChunks(),
                         repository.getIndexingTotalChunks(),
                         "Interrupted",
@@ -156,7 +154,8 @@ public class RepositoryIndexService {
                                 repository,
                                 "FAILED",
                                 repository.getIndexingProgress() == null
-                                        ? 0 : repository.getIndexingProgress(),
+                                        ? 0
+                                        : repository.getIndexingProgress(),
                                 repository.getIndexedChunks(),
                                 repository.getIndexingTotalChunks(),
                                 "Indexing failed",
@@ -172,9 +171,8 @@ public class RepositoryIndexService {
         long indexingStartedNanos = System.nanoTime();
         RepositoryInfo repository = repositoryInfoRepository
                 .findById(repositoryId)
-                .orElseThrow(() ->
-                        new IllegalArgumentException("Repository not found: "
-                                + repositoryId));
+                .orElseThrow(() -> new IllegalArgumentException("Repository not found: "
+                        + repositoryId));
 
         updateStatus(
                 repository,
@@ -223,8 +221,7 @@ public class RepositoryIndexService {
                     "No indexable source files were found.");
         }
 
-        List<SelectedIndexFile> selectedFiles =
-                selectQuickIndexFiles(indexableFiles, MAX_QUICK_INDEX_CHUNKS);
+        List<SelectedIndexFile> selectedFiles = selectQuickIndexFiles(indexableFiles, MAX_QUICK_INDEX_CHUNKS);
         Map<String, ExistingFileIndex> existingFiles = loadExistingFileIndex(repositoryId);
         List<SelectedIndexFile> changedFiles = new ArrayList<>();
         Map<String, String> reusableFiles = new HashMap<>();
@@ -252,8 +249,7 @@ public class RepositoryIndexService {
         int lastProgress = 5;
         boolean embeddingStageStarted = false;
         int downloadedFiles = 0;
-        List<Document> documentBatch =
-                new ArrayList<>(MAX_DOCUMENTS_PER_BATCH);
+        List<Document> documentBatch = new ArrayList<>(MAX_DOCUMENTS_PER_BATCH);
         updateStatus(
                 repository,
                 "IN_PROGRESS",
@@ -265,15 +261,12 @@ public class RepositoryIndexService {
                         : "Downloading source files (0/" + changedFiles.size() + ")",
                 null);
         try {
-            try (var downloadExecutor =
-                         Executors.newVirtualThreadPerTaskExecutor()) {
-                for (int offset = 0; offset < changedFiles.size();
-                        offset += MAX_CONCURRENT_DOWNLOADS) {
+            try (var downloadExecutor = Executors.newVirtualThreadPerTaskExecutor()) {
+                for (int offset = 0; offset < changedFiles.size(); offset += MAX_CONCURRENT_DOWNLOADS) {
                     int batchEnd = Math.min(
                             offset + MAX_CONCURRENT_DOWNLOADS,
                             changedFiles.size());
-                    List<CompletableFuture<DownloadedFile>> downloads =
-                            new ArrayList<>(batchEnd - offset);
+                    List<CompletableFuture<DownloadedFile>> downloads = new ArrayList<>(batchEnd - offset);
 
                     for (int fileIndex = offset; fileIndex < batchEnd; fileIndex++) {
                         String path = changedFiles.get(fileIndex).file()
@@ -295,9 +288,8 @@ public class RepositoryIndexService {
                         }
                         downloadedFiles++;
                         if (!embeddingStageStarted) {
-                            int downloadProgress = 5 + (int) (
-                                    (long) downloadedFiles * 5
-                                            / Math.max(1, changedFiles.size()));
+                            int downloadProgress = 5 + (int) ((long) downloadedFiles * 5
+                                    / Math.max(1, changedFiles.size()));
                             lastProgress = Math.max(lastProgress, downloadProgress);
                             updateStatus(
                                     repository,
@@ -314,9 +306,8 @@ public class RepositoryIndexService {
                                 && !downloaded.content().isBlank()) {
                             List<String> chunks = chunkContent(downloaded.content());
                             int chunkLimit = changedFiles.get(fileIndex).chunkLimit();
-                            for (int chunkNumber = 0;
-                                    chunkNumber < Math.min(chunks.size(), chunkLimit);
-                                    chunkNumber++) {
+                            for (int chunkNumber = 0; chunkNumber < Math.min(chunks.size(),
+                                    chunkLimit); chunkNumber++) {
                                 documentBatch.add(new Document(
                                         chunks.get(chunkNumber),
                                         Map.of(
@@ -327,12 +318,9 @@ public class RepositoryIndexService {
                                                         .file().path("sha").asText(""),
                                                 "chunkNumber", chunkNumber,
                                                 "indexScope", "quick",
-                                                "indexVersion", indexVersion
-                                        )
-                                ));
+                                                "indexVersion", indexVersion)));
 
-                                if (documentBatch.size()
-                                        >= MAX_DOCUMENTS_PER_BATCH) {
+                                if (documentBatch.size() >= MAX_DOCUMENTS_PER_BATCH) {
                                     int progress = embeddingProgress(
                                             indexedDocuments,
                                             estimatedTotalChunks);
@@ -350,9 +338,8 @@ public class RepositoryIndexService {
                                                 null);
                                         embeddingStageStarted = true;
                                     }
-                                    indexedDocuments +=
-                                            addDocumentsWithTokenLimitFallback(
-                                                    documentBatch);
+                                    indexedDocuments += addDocumentsWithTokenLimitFallback(
+                                            documentBatch);
                                     documentBatch.clear();
                                     progress = embeddingProgress(
                                             indexedDocuments,
@@ -387,8 +374,7 @@ public class RepositoryIndexService {
                             "Creating quick Q&A embeddings",
                             null);
                 }
-                indexedDocuments +=
-                        addDocumentsWithTokenLimitFallback(documentBatch);
+                indexedDocuments += addDocumentsWithTokenLimitFallback(documentBatch);
                 documentBatch.clear();
             }
 
@@ -397,7 +383,8 @@ public class RepositoryIndexService {
                         "No indexable source files were found.");
             }
             // Only switch unchanged files to the new version after all changed files
-            // have embedded successfully. If indexing fails, the old version remains usable.
+            // have embedded successfully. If indexing fails, the old version remains
+            // usable.
             if (!reusableFiles.isEmpty()) {
                 updateReusableFileMetadata(
                         repositoryId, indexVersion, reusableFiles);
@@ -426,8 +413,7 @@ public class RepositoryIndexService {
                         "WHERE metadata->>'repositoryId' = ? " +
                         "AND metadata->>'indexVersion' IS DISTINCT FROM ?",
                 repositoryId.toString(),
-                indexVersion
-        );
+                indexVersion);
 
         updateStatus(
                 repository,
@@ -436,11 +422,11 @@ public class RepositoryIndexService {
                 indexedDocuments,
                 indexedDocuments,
                 "Quick Q&A preparation complete",
-                null
-        );
+                null);
         long elapsedMillis = (System.nanoTime() - indexingStartedNanos) / 1_000_000;
         long cleanupMillis = (System.nanoTime() - cleanupStartedNanos) / 1_000_000;
-        log.info("Quick repository indexing completed: repositoryId={}, eligibleFiles={}, selectedFiles={}, reusedFiles={}, chunks={}, cleanupMs={}, elapsedMs={}",
+        log.info(
+                "Quick repository indexing completed: repositoryId={}, eligibleFiles={}, selectedFiles={}, reusedFiles={}, chunks={}, cleanupMs={}, elapsedMs={}",
                 repositoryId, indexableFiles.size(), selectedFiles.size(),
                 reusableFiles.size(), indexedDocuments, cleanupMillis, elapsedMillis);
 
@@ -473,7 +459,8 @@ public class RepositoryIndexService {
 
     private Map<String, ExistingFileIndex> loadExistingFileIndex(Long repositoryId) {
         List<ExistingFileIndex> rows = jdbcTemplate.query(
-                "SELECT metadata->>'filePath' AS file_path, metadata->>'blobSha' AS blob_sha, COUNT(*) AS chunk_count " +
+                "SELECT metadata->>'filePath' AS file_path, metadata->>'blobSha' AS blob_sha, COUNT(*) AS chunk_count "
+                        +
                         "FROM vector_store WHERE metadata->>'repositoryId' = ? AND metadata->>'blobSha' IS NOT NULL " +
                         "GROUP BY metadata->>'filePath', metadata->>'blobSha'",
                 (rs, rowNum) -> new ExistingFileIndex(
@@ -503,8 +490,7 @@ public class RepositoryIndexService {
 
         List<JsonNode> prioritizedFiles = new ArrayList<>(files);
         prioritizedFiles.sort(
-                Comparator.comparingInt((JsonNode file) ->
-                                quickIndexPriority(file.path("path").asText()))
+                Comparator.comparingInt((JsonNode file) -> quickIndexPriority(file.path("path").asText()))
                         .thenComparing(file -> file.path("path").asText()));
 
         Map<String, Integer> selectedChunkLimits = new LinkedHashMap<>();
@@ -609,8 +595,7 @@ public class RepositoryIndexService {
                         "WHERE metadata->>'repositoryId' = ? " +
                         "AND metadata->>'indexVersion' = ?",
                 repositoryId.toString(),
-                indexVersion
-        );
+                indexVersion);
     }
 
     private void updateStatus(
@@ -687,7 +672,7 @@ public class RepositoryIndexService {
             if (documents.size() > 1) {
                 int midpoint = documents.size() / 2;
                 return addDocumentsWithTokenLimitFallback(
-                                documents.subList(0, midpoint))
+                        documents.subList(0, midpoint))
                         + addDocumentsWithTokenLimitFallback(
                                 documents.subList(midpoint, documents.size()));
             }
@@ -731,8 +716,8 @@ public class RepositoryIndexService {
             String normalizedMessage = message.toLowerCase();
             if ((normalizedMessage.contains("token")
                     && (normalizedMessage.contains("too large")
-                    || normalizedMessage.contains("exceed")
-                    || normalizedMessage.contains("limit")))
+                            || normalizedMessage.contains("exceed")
+                            || normalizedMessage.contains("limit")))
                     || normalizedMessage.contains("maximum context length")) {
                 return true;
             }
@@ -794,7 +779,7 @@ public class RepositoryIndexService {
             throw new IllegalArgumentException("Invalid GitHub repository URL");
         }
 
-        return new String[]{
+        return new String[] {
                 parts[0],
                 parts[1].replaceFirst("\\.git$", "")
         };
